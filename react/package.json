@@ -21,6 +21,7 @@
 		"@tanstack/react-start": "latest",
 		"@videojs/react": "^10.0.0-beta.32",
 		"lucide-react": "^1.41.0",
+		"motion": "^13.2.0",
 		"react": "^19.2.0",
 		"react-dom": "^19.2.0",
 		"tailwind-merge": "^3.6.0",

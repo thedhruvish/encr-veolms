@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, memo } from "react";
-import { Controls, useCaptionsOptions } from "@videojs/react";
+import { useCaptionsOptions } from "@videojs/react";
 import { Video } from "@videojs/react/video";
 import { HlsJsVideo } from "@videojs/react/media/hlsjs-video";
 import {
@@ -83,7 +83,7 @@ function DvideoPlayerInner({
   const [feedback, setFeedback] = useState<{ type: "play" | "pause"; key: number } | null>(null);
   const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
   const [isBuffering, setIsBuffering] = useState(false);
-  const [showControls, setShowControls] = useState(false);
+  const [showControls, setShowControls] = useState(true);
 
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -94,7 +94,7 @@ function DvideoPlayerInner({
     if (!state.paused) {
       controlsTimeoutRef.current = setTimeout(() => {
         setShowControls(false);
-      }, 3000);
+      }, 3500);
     }
   };
 
@@ -526,10 +526,10 @@ function DvideoPlayerInner({
       )}
 
       {/* Custom Controls Overlay */}
-      <Controls.Root
+      <div
         className={cn(
-          "absolute inset-0 flex flex-col justify-between bg-gradient-to-t from-black/90 via-black/20 to-black/50 p-4 transition-opacity duration-300 z-30 pointer-events-none",
-          showControls ? "opacity-100" : "opacity-0"
+          "absolute inset-0 flex flex-col justify-between bg-gradient-to-t from-black/95 via-transparent to-black/40 p-4 transition-opacity duration-300 z-30 pointer-events-none",
+          showControls ? "opacity-100" : "opacity-0 group-hover:opacity-100"
         )}
       >
         {/* Top Row: Keyboard Shortcut Info Button */}
@@ -686,7 +686,7 @@ function DvideoPlayerInner({
             </div>
           </div>
         </div>
-      </Controls.Root>
+      </div>
 
       <ResumePlaybackTracker
         src={src}
