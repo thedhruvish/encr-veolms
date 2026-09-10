@@ -164,6 +164,22 @@ async function runTests() {
     "License request with foreign KID returns 403/404"
   );
 
+  // 5d. Batch key retrieval: single request returns all keys for video
+  const batchLicenseRes = await app.request(`/license/clearkey?vid=${vid}&st=${encodeURIComponent(st1)}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Origin: origin,
+    },
+    body: JSON.stringify({
+      all: true,
+      type: "temporary",
+    }),
+  });
+  assert(batchLicenseRes.status === 200, "POST /license/clearkey with all:true returns 200 OK");
+  const batchData: any = await batchLicenseRes.json();
+  assert(Array.isArray(batchData.keys) && batchData.keys.length === 22, "Batch license returns all 22 keys in 1 request");
+
   // 6. Test Single Active Session Enforcement
   console.log("\nSimulating user opening a 2nd device / tab...");
   const secondVideoRes = await app.request("/video", {

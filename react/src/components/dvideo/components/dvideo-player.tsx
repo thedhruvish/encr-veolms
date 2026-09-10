@@ -61,6 +61,22 @@ interface Props {
   onTokenRefreshNeeded?: () => void;
 }
 
+function base64UrlToHex(str: string): string {
+  if (/^[0-9a-fA-F]{32}$/.test(str)) {
+    return str.toLowerCase();
+  }
+  let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
+  while (b64.length % 4 !== 0) {
+    b64 += "=";
+  }
+  const bin = atob(b64);
+  let hex = "";
+  for (let i = 0; i < bin.length; i++) {
+    hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
+  }
+  return hex.toLowerCase();
+}
+
 function DvideoPlayerInner({
   src,
   type,
@@ -84,6 +100,8 @@ function DvideoPlayerInner({
   const store = Player.usePlayer();
   const media = Player.useMedia();
 
+  const [clearKeys, setClearKeys] = useState<Record<string, string> | null>(null);
+  const [isLoadingKeys, setIsLoadingKeys] = useState(false);
   const [isSessionSuperseded, setIsSessionSuperseded] = useState(false);
   const [isCdmUnsupported, setIsCdmUnsupported] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
@@ -288,6 +306,85 @@ function DvideoPlayerInner({
     setIsSessionSuperseded(false);
     onReclaimSession?.();
   };
+
+  // Pre-fetch ClearKey licenses in a single batch request to avoid N separate period calls
+  useEffect(() => {
+    if (
+      !encryption ||
+      encryption.keySystem !== "org.w3.clearkey" ||
+      !encryption.licenseUrl
+    ) {
+      setClearKeys(null);
+      setIsLoadingKeys(false);
+      return;
+    }
+
+    let isCancelled = false;
+    setIsLoadingKeys(true);
+
+    const fetchKeys = async () => {
+      try {
+        const res = await fetch(encryption.licenseUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ type: "temporary", all: true }),
+        });
+
+        if (isCancelled) return;
+
+        if (!res.ok) {
+          if (res.status === 401) {
+            try {
+              const errData: any = await res.json();
+              if (errData?.error === "session_superseded") {
+                store.pause();
+                setIsSessionSuperseded(true);
+                onSessionSupersededRef.current?.();
+                return;
+              }
+              if (errData?.error === "token_expired") {
+                onTokenRefreshNeededRef.current?.();
+                return;
+              }
+            } catch {}
+          }
+          throw new Error(`License fetch failed with status ${res.status}`);
+        }
+
+        const data: any = await res.json();
+        if (isCancelled) return;
+
+        if (Array.isArray(data?.keys)) {
+          const map: Record<string, string> = {};
+          for (const kItem of data.keys) {
+            if (kItem?.kid && kItem?.k) {
+              const kidHex = base64UrlToHex(kItem.kid);
+              const keyHex = base64UrlToHex(kItem.k);
+              map[kidHex] = keyHex;
+            }
+          }
+          setClearKeys(map);
+        }
+      } catch (err) {
+        if (!isCancelled) {
+          console.error("Failed to prefetch ClearKey license:", err);
+          handleCustomError(err);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsLoadingKeys(false);
+        }
+      }
+    };
+
+    fetchKeys();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [encryption?.licenseUrl, st, src]);
 
   const resetControlsTimeout = () => {
     if (controlsTimeoutRef.current) {
@@ -703,33 +800,48 @@ function DvideoPlayerInner({
       />
 
       {isDash ? (
-        <ShakaVideo
-          source={{
-            src,
-            type: "application/dash+xml",
-            drm: encryption
-              ? {
-                  [encryption.keySystem]: {
-                    licenseUrl: encryption.licenseUrl,
+        isLoadingKeys ? (
+          <div className="w-full h-full flex flex-col items-center justify-center gap-3">
+            <div className="w-8 h-8 border-2 border-zinc-700 border-t-white rounded-full animate-spin" />
+            <p className="text-xs text-zinc-400 font-mono">Initializing secure player...</p>
+          </div>
+        ) : (
+          <ShakaVideo
+            source={{
+              src,
+              type: "application/dash+xml",
+              drm: encryption
+                ? {
+                    [encryption.keySystem]: {
+                      licenseUrl: encryption.licenseUrl,
+                    },
+                  }
+                : undefined,
+              engine: {
+                shaka: {
+                  drm: {
+                    ...(clearKeys ? { clearKeys } : {}),
+                    delayLicenseRequestUntilPlayed: true,
                   },
-                }
-              : undefined,
-          }}
-          poster={poster}
-          className="w-full h-full object-contain"
-          playsInline
-          onWaiting={() => setIsBuffering(true)}
-          onPlaying={() => setIsBuffering(false)}
-          onSeeking={() => setIsBuffering(true)}
-          onSeeked={() => setIsBuffering(false)}
-          onCanPlay={() => setIsBuffering(false)}
-          onCanPlayThrough={() => setIsBuffering(false)}
-          onLoadedData={() => setIsBuffering(false)}
-          onPause={() => setIsBuffering(false)}
-          onAbort={() => setIsBuffering(false)}
-          onEmptied={() => setIsBuffering(false)}
-          onError={handleCustomError}
-        />
+                },
+              },
+            }}
+            poster={poster}
+            className="w-full h-full object-contain"
+            playsInline
+            onWaiting={() => setIsBuffering(true)}
+            onPlaying={() => setIsBuffering(false)}
+            onSeeking={() => setIsBuffering(true)}
+            onSeeked={() => setIsBuffering(false)}
+            onCanPlay={() => setIsBuffering(false)}
+            onCanPlayThrough={() => setIsBuffering(false)}
+            onLoadedData={() => setIsBuffering(false)}
+            onPause={() => setIsBuffering(false)}
+            onAbort={() => setIsBuffering(false)}
+            onEmptied={() => setIsBuffering(false)}
+            onError={handleCustomError}
+          />
+        )
       ) : isHls ? (
         <HlsJsVideo
           src={src}

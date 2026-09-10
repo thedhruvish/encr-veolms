@@ -580,24 +580,85 @@ const handleClearKeyLicense = async (c: any) => {
   }
   const sid = validation.payload!.sid as string;
 
-  let body: { kids?: string[]; type?: string };
-  try {
-    body = await c.req.json();
-  } catch {
+  let body: { kids?: string[]; type?: string; all?: boolean } = {};
+  if (c.req.method === "POST") {
+    let rawText = "";
     try {
-      const rawText = await c.req.text();
-      body = JSON.parse(rawText);
+      rawText = await c.req.text();
     } catch {
-      return c.json({ error: "Invalid license request body. Expected JSON." }, 400);
+      rawText = "";
     }
-  }
-
-  if (!body.kids || !Array.isArray(body.kids)) {
-    return c.json({ error: "Missing or invalid 'kids' array in Clear Key request." }, 400);
+    if (rawText && rawText.trim().length > 0) {
+      try {
+        body = JSON.parse(rawText);
+      } catch {
+        return c.json({ error: "Invalid license request body. Expected JSON." }, 400);
+      }
+    }
   }
 
   const db = createDb(c.env);
 
+  // If client requests all keys (body.all === true, or kids array omitted/empty)
+  if (body.all || !body.kids || !Array.isArray(body.kids) || body.kids.length === 0) {
+    if (!vid) {
+      return c.json({ error: "Missing 'vid' parameter for batch key request." }, 400);
+    }
+
+    // Fetch all keys for this video from DB
+    const periodRows = await db`
+      SELECT vkp.period_idx, vkp.key_id, dk.key_val
+      FROM video_key_periods vkp
+      LEFT JOIN drm_keys dk ON LOWER(vkp.key_id) = LOWER(dk.key_id)
+      WHERE vkp.video_id = ${vid}
+      ORDER BY vkp.period_idx ASC
+    `;
+
+    let keysData: { kidHex: string; keyHex: string }[] = [];
+    if (periodRows.length > 0) {
+      for (const row of periodRows) {
+        const kidHex = String(row.key_id).toLowerCase();
+        const keyHex = (row.key_val || KEY_STORE[kidHex]) as string | undefined;
+        if (keyHex) {
+          keysData.push({ kidHex, keyHex });
+        }
+      }
+    } else if (VIDEOS[vid]) {
+      for (const p of VIDEOS[vid].periods) {
+        const kidHex = p.keyId.toLowerCase();
+        const keyHex = KEY_STORE[kidHex];
+        if (keyHex) {
+          keysData.push({ kidHex, keyHex });
+        }
+      }
+    }
+
+    if (keysData.length === 0) {
+      return c.json({ error: "no_keys_found", message: `No keys found for video ${vid}.` }, 404);
+    }
+
+    // Persist all issued keys in DB for this session
+    for (const { kidHex } of keysData) {
+      await db`
+        INSERT INTO issued_license_keys (session_id, key_id)
+        VALUES (${sid}, ${kidHex})
+        ON CONFLICT (session_id, key_id) DO NOTHING
+      `;
+    }
+
+    const keys = keysData.map(({ kidHex, keyHex }) => ({
+      kty: "oct",
+      k: hexToBase64Url(keyHex),
+      kid: hexToBase64Url(kidHex),
+    }));
+
+    return c.json({
+      keys,
+      type: body.type || "temporary",
+    });
+  }
+
+  // Handle specific KIDs requested
   let allowedKids = new Set<string>();
   if (vid) {
     const periods = await db`
@@ -610,14 +671,6 @@ const handleClearKeyLicense = async (c: any) => {
     }
   }
 
-  // Check which KIDs have already been issued to this session in the database
-  const issuedRows = await db`
-    SELECT key_id FROM issued_license_keys WHERE session_id = ${sid}
-  `;
-  const issuedKidSet = new Set(
-    issuedRows.map((r: any) => String(r.key_id).toLowerCase())
-  );
-
   const keys: { kty: string; k: string; kid: string }[] = [];
 
   for (const kidB64Url of body.kids) {
@@ -629,17 +682,6 @@ const handleClearKeyLicense = async (c: any) => {
         {
           error: "unauthorized_kid",
           message: `Requested KID ${kidHex} does not belong to video ${vid}.`,
-        },
-        403
-      );
-    }
-
-    // Single-use lock in DB: check if already issued
-    if (issuedKidSet.has(kidHex)) {
-      return c.json(
-        {
-          error: "key_already_issued",
-          message: `KID ${kidHex} was already issued to this session.`,
         },
         403
       );
@@ -682,6 +724,8 @@ const handleClearKeyLicense = async (c: any) => {
 };
 
 app.post("/license/clearkey", handleClearKeyLicense);
+app.get("/license/clearkey", handleClearKeyLicense);
 app.post("/api/license/clearkey", handleClearKeyLicense);
+app.get("/api/license/clearkey", handleClearKeyLicense);
 
 export default app;
