@@ -4,7 +4,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "hono",
+	"name": "encr-veolms-hono",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-09-03",
 	"assets": {
@@ -18,7 +18,8 @@
 	},
 	"upload_source_maps": true,
 	"vars": {
-		"S3_PUBLIC_URL": "https://protech-assets.dhruvish.in"
+		"S3_PUBLIC_URL": "https://protech-assets.dhruvish.in",
+		"DATABASE_URL": "postgresql://neondb_owner:npg_Q9f1jeSMVwFJ@ep-nameless-glitter-ayzqhmzw-pooler.c-5.us-east-2.aws.neon.tech/neondb?channel_binding=require&sslmode=require"
 	}
 	/**
 	 * Smart Placement
