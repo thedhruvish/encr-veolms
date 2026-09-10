@@ -180,9 +180,26 @@ function DvideoPlayerInner({
     const networkingEngine = engine.getNetworkingEngine?.();
     if (!networkingEngine) return;
 
-    // No request filter needed: the manifest and segments are fetched directly from the
-    // public CDN (no backend proxy, no token), and the license URL already carries its
-    // own `st` token baked in by the backend - it's the only backend-gated request left.
+    // DASH does not carry the manifest query string onto relative segment URLs. Add
+    // the short-lived playback token to every same-origin protected-media request.
+    const sourceUrl = new URL(src, window.location.href);
+    const requestFilter = (_type: any, request: any) => {
+      if (!st) return;
+
+      request.uris = request.uris.map((uri: string) => {
+        try {
+          const url = new URL(uri, sourceUrl);
+          if (
+            url.origin === sourceUrl.origin &&
+            url.pathname.startsWith("/assets/")
+          ) {
+            url.searchParams.set("st", st);
+            return url.toString();
+          }
+        } catch {}
+        return uri;
+      });
+    };
     const responseFilter = (_type: any, response: any) => {
       if (response && response.status === 401) {
         setIsBuffering(false);
@@ -226,16 +243,18 @@ function DvideoPlayerInner({
       }
     };
 
+    networkingEngine.registerRequestFilter(requestFilter);
     networkingEngine.registerResponseFilter(responseFilter);
     engine.addEventListener?.("error", handleEngineError);
 
     return () => {
       try {
+        networkingEngine.unregisterRequestFilter(requestFilter);
         networkingEngine.unregisterResponseFilter(responseFilter);
         engine.removeEventListener?.("error", handleEngineError);
       } catch {}
     };
-  }, [media, src, store]);
+  }, [media, src, st, store]);
 
   const handleCustomError = (err?: unknown) => {
     setIsBuffering(false);

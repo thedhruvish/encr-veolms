@@ -36,8 +36,8 @@ lerna-debug.log*
 !.dev.vars.example
 !.env.example
 
-# pipeline & generated registries
-src/registry.generated.ts
+# The encrypted registry is required by the deployed Worker. It contains the
+# server-side Clear Key material and must be included in the deployment source.
 scripts/registry.local.json
 public/assets/
 scratch/

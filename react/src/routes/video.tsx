@@ -201,9 +201,14 @@ function VideoPage() {
   const playerEncryption = videoData?.encryption
     ? {
         ...videoData.encryption,
-        licenseUrl: videoData.encryption.licenseUrl.startsWith('http')
-          ? videoData.encryption.licenseUrl
-          : `${API_BASE_URL}${videoData.encryption.licenseUrl}`,
+        licenseUrl: (() => {
+          const licenseUrl = new URL(
+            videoData.encryption.licenseUrl,
+            `${API_BASE_URL.replace(/\/+$/, '')}/`,
+          );
+          if (activeSt) licenseUrl.searchParams.set('st', activeSt);
+          return licenseUrl.toString();
+        })(),
       }
     : undefined;
 
@@ -425,4 +430,3 @@ function VideoPage() {
     </div>
   );
 }
-

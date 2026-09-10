@@ -2,25 +2,16 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { getCookie, setCookie, deleteCookie } from "hono/cookie";
 import { sign, verify } from "hono/jwt";
+import {
+  GENERATED_DEFAULT_VIDEO_ID,
+  GENERATED_KEY_STORE,
+  GENERATED_VIDEOS,
+} from "./registry.generated";
 export interface VideoRecord {
   id: string;
   title: string;
   manifestPath: string;
   periods: { index: number; keyId: string /* hex */ }[];
-}
-
-let GENERATED_VIDEOS: Record<string, VideoRecord> = {};
-let GENERATED_KEY_STORE: Record<string, string> = {};
-let GENERATED_DEFAULT_VIDEO_ID = "";
-
-try {
-  // @ts-ignore - safe fallback when gitignored registry.generated.ts does not yet exist
-  const generated = await import("./registry.generated");
-  GENERATED_VIDEOS = generated.GENERATED_VIDEOS || {};
-  GENERATED_KEY_STORE = generated.GENERATED_KEY_STORE || {};
-  GENERATED_DEFAULT_VIDEO_ID = generated.GENERATED_DEFAULT_VIDEO_ID || "";
-} catch {
-  // Safe fallback defaults when registry has not yet been generated
 }
 
 const app = new Hono<{ Bindings: CloudflareBindings }>();
@@ -34,9 +25,13 @@ const ALLOWED_EMAIL = "dhruvish@gmail.com";
 const PLAYBACK_JWT_SECRET = "veolms-playback-clearkey-secret-2026";
 const PLAYBACK_TOKEN_EXPIRY_SECONDS = 30 * 60; // 30 minutes playback session token
 const ALLOWED_ORIGIN = "https://encr-veolms.dhruvish.in";
-
-// Fallback Video Registry & Key Store (auto-populated from registry.generated.ts)
-const FALLBACK_DEFAULT_VIDEO_ID = "58fce6ff-a200-4f81-8d3c-79e1b521acbb";
+const LOCAL_ORIGINS = new Set([
+  "http://localhost:3000",
+  "http://localhost:5173",
+  "http://127.0.0.1:3000",
+  "http://127.0.0.1:5173",
+]);
+const VIDEO_PUBLIC_BASE_URL = "https://protech-assets.dhruvish.in";
 
 const VIDEOS: Record<string, VideoRecord> = {
   ...GENERATED_VIDEOS,
@@ -47,7 +42,7 @@ const KEY_STORE: Record<string, string> = {
 };
 
 const DEFAULT_VIDEO_ID =
-  GENERATED_DEFAULT_VIDEO_ID || Object.keys(VIDEOS)[0] || FALLBACK_DEFAULT_VIDEO_ID;
+  GENERATED_DEFAULT_VIDEO_ID || Object.keys(VIDEOS)[0] || "";
 
 /**
  * Single Active Session Tracker:
@@ -74,18 +69,9 @@ function isOriginAllowed(originOrReferer: string | undefined): boolean {
   try {
     const url = new URL(originOrReferer);
     const origin = url.origin;
-    return (
-      origin === ALLOWED_ORIGIN ||
-      origin === "http://localhost:5173" ||
-      origin === "http://127.0.0.1:3000" ||
-      origin === "http://127.0.0.1:5173"
-    );
+    return origin === ALLOWED_ORIGIN || LOCAL_ORIGINS.has(origin);
   } catch {
-    return (
-      originOrReferer.startsWith(ALLOWED_ORIGIN) ||
-      originOrReferer.startsWith("http://localhost:5173") ||
-      originOrReferer.startsWith("http://127.0.0.1:3000")
-    );
+    return false;
   }
 }
 
@@ -399,20 +385,15 @@ const handleVideo = async (c: any) => {
   const requestedVid = c.req.query("id") || DEFAULT_VIDEO_ID;
   const videoRecord = VIDEOS[requestedVid];
 
-  // If no encrypted video was generated yet, fallback to a direct unencrypted stream.
-  // Served straight from media.veolms.org - no backend proxy, no manifest/license/session
-  // machinery involved, the browser fetches it directly like any other <video src>.
   if (!videoRecord) {
-    return c.json({
-      authenticated: true,
-      video: {
-        id: requestedVid,
-        title: "Default Stream",
-        src: "https://media.veolms.org/video.mp4",
-        type: "video/mp4",
-        user: payload.email,
+    return c.json(
+      {
+        authenticated: true,
+        error: "encrypted_video_not_configured",
+        message: "No encrypted video is configured for this video ID.",
       },
-    });
+      404,
+    );
   }
 
   const now = Math.floor(Date.now() / 1000);
@@ -432,10 +413,10 @@ const handleVideo = async (c: any) => {
 
   const st = await sign(stPayload, PLAYBACK_JWT_SECRET, "HS256");
 
-  // Manifest + segments are served directly from the public R2 domain - no backend proxy.
-  // Only the Clear Key license (the actual secret) is gated behind the backend/session/token.
-  const publicBase = (getEnv(c, "S3_PUBLIC_URL") || "").replace(/['"]/g, "").trim().replace(/\/+$/, "");
-  const manifestUrl = `${publicBase}/${videoRecord.manifestPath}`;
+  // Keep the media URL same-origin so the Worker can authorize the manifest and every
+  // segment request. The proxy fetches the encrypted bytes from the public R2 domain;
+  // the decryption key is still returned only by the gated Clear Key license endpoint.
+  const manifestUrl = `/assets/${videoRecord.manifestPath}?st=${encodeURIComponent(st)}`;
 
   return c.json({
     authenticated: true,
@@ -465,6 +446,119 @@ app.get("/api/video", handleVideo);
 function getEnv(c: any, key: string): string | undefined {
   return c.env?.[key] || (typeof process !== "undefined" ? (process.env as any)?.[key] : undefined);
 }
+
+function getVideoPublicBaseUrl(c: any): string {
+  return (getEnv(c, "S3_PUBLIC_URL") || VIDEO_PUBLIC_BASE_URL)
+    .replace(/['"]/g, "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+function getVideoAssetPath(
+  urlString: string,
+): { videoId: string; objectKey: string } | null {
+  const pathname = new URL(urlString).pathname;
+  const prefix = "/assets/";
+  if (!pathname.startsWith(prefix)) return null;
+
+  const encodedParts = pathname.slice(prefix.length).split("/");
+  if (encodedParts.length < 2 || encodedParts.some((part) => !part))
+    return null;
+
+  try {
+    const parts = encodedParts.map((part) => decodeURIComponent(part));
+    if (
+      parts.some(
+        (part) => !part || part === "." || part === ".." || /[\/\\]/.test(part),
+      )
+    ) {
+      return null;
+    }
+
+    return {
+      videoId: parts[0],
+      objectKey: parts.join("/"),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getVideoAssetContentType(objectKey: string): string {
+  if (objectKey.endsWith(".mpd")) return "application/dash+xml";
+  if (objectKey.endsWith(".m4s")) return "video/mp4";
+  return "application/octet-stream";
+}
+
+/**
+ * Route: GET/HEAD /assets/:id/*
+ * Authenticates the playback session, then proxies encrypted DASH bytes from public R2.
+ * The R2 object is never treated as a decryption source by this Worker; only the
+ * Clear Key license route returns key material to the browser media subsystem.
+ */
+const handleVideoAsset = async (c: any) => {
+  const originHeader = c.req.header("Origin") || c.req.header("Referer");
+  if (originHeader && !isOriginAllowed(originHeader)) {
+    return c.json({ error: "Forbidden. Origin not permitted." }, 403);
+  }
+
+  const asset = getVideoAssetPath(c.req.url);
+  if (!asset) return c.text("Not Found", 404);
+
+  const validation = await validatePlaybackToken(c, asset.videoId);
+  if (!validation.valid) {
+    return c.json(
+      { error: validation.error, message: validation.message },
+      validation.status as any,
+    );
+  }
+
+  if (!VIDEOS[asset.videoId]) return c.text("Not Found", 404);
+
+  const encodedKey = asset.objectKey
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/");
+  const upstreamUrl = `${getVideoPublicBaseUrl(c)}/${encodedKey}`;
+  const upstreamHeaders = new Headers();
+
+  for (const headerName of ["Range", "If-None-Match", "If-Modified-Since"]) {
+    const value = c.req.header(headerName);
+    if (value) upstreamHeaders.set(headerName, value);
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(upstreamUrl, {
+      method: c.req.method,
+      headers: upstreamHeaders,
+    });
+  } catch {
+    return c.json({ error: "video_storage_unavailable" }, 502);
+  }
+
+  const responseHeaders = new Headers();
+  upstream.headers.forEach((value, key) => {
+    if (!key.toLowerCase().startsWith("access-control-")) {
+      responseHeaders.set(key, value);
+    }
+  });
+  if (!responseHeaders.has("Content-Type")) {
+    responseHeaders.set(
+      "Content-Type",
+      getVideoAssetContentType(asset.objectKey),
+    );
+  }
+  responseHeaders.set("Cache-Control", "private, no-store, max-age=0");
+  responseHeaders.set("X-Content-Type-Options", "nosniff");
+
+  return new Response(c.req.method === "HEAD" ? null : upstream.body, {
+    status: upstream.status,
+    headers: responseHeaders,
+  });
+};
+
+app.on(["GET", "HEAD"], "/assets/*", handleVideoAsset);
 
 /**
  * Route: POST /license/clearkey and /api/license/clearkey
@@ -569,4 +663,3 @@ app.post("/license/clearkey", handleClearKeyLicense);
 app.post("/api/license/clearkey", handleClearKeyLicense);
 
 export default app;
-
