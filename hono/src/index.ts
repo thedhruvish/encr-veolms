@@ -33,7 +33,7 @@ const ALLOWED_EMAIL = "dhruvish@gmail.com";
 // Playback Token & EME Configuration
 const PLAYBACK_JWT_SECRET = "veolms-playback-clearkey-secret-2026";
 const PLAYBACK_TOKEN_EXPIRY_SECONDS = 30 * 60; // 30 minutes playback session token
-const ALLOWED_ORIGIN = "http://localhost:3000";
+const ALLOWED_ORIGIN = "https://encr-veolms.dhruvish.in";
 
 // Fallback Video Registry & Key Store (auto-populated from registry.generated.ts)
 const FALLBACK_DEFAULT_VIDEO_ID = "58fce6ff-a200-4f81-8d3c-79e1b521acbb";
