@@ -36,7 +36,7 @@ export function DialogTrigger({
   if (!ctx) return null;
 
   if (render && React.isValidElement(render)) {
-    return React.cloneElement(render, {
+    return React.cloneElement(render as React.ReactElement<any>, {
       onClick: (e: React.MouseEvent) => {
         (render.props as any)?.onClick?.(e);
         ctx.onOpenChange(!ctx.open);
@@ -54,7 +54,7 @@ export function DialogTrigger({
 export function DialogContent({
   className,
   children,
-  container,
+  container: _container,
 }: {
   className?: string;
   children: React.ReactNode;

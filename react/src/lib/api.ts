@@ -85,6 +85,12 @@ export async function getMeApi(token?: string | null): Promise<MeResponse> {
   return data as MeResponse;
 }
 
+export interface VideoEncryptionConfig {
+  scheme: string;
+  keySystem: string;
+  licenseUrl: string;
+}
+
 export interface VideoResponse {
   authenticated: boolean;
   video: {
@@ -93,6 +99,11 @@ export interface VideoResponse {
     src: string;
     type: string;
     user: string;
+    st?: string;
+    periodCount?: number;
+    expiresAt?: string;
+    expiresInSeconds?: number;
+    encryption?: VideoEncryptionConfig;
   };
   error?: string;
 }

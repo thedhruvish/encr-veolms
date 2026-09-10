@@ -16,6 +16,14 @@ const config = defineConfig({
         target: 'http://localhost:8787',
         changeOrigin: true,
       },
+      '/assets': {
+        target: 'http://localhost:8787',
+        changeOrigin: true,
+      },
+      '/license': {
+        target: 'http://localhost:8787',
+        changeOrigin: true,
+      },
     },
   },
   plugins: [

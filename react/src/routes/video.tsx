@@ -1,12 +1,20 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router';
-import React, { useEffect, useState, Suspense } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { useAuth } from '../lib/auth-context';
-import { getVideoApi, type VideoResponse } from '../lib/api';
-import { ShieldCheck, Play, RefreshCw, AlertCircle, Sparkles, KeyRound, Loader2 } from 'lucide-react';
+import { getVideoApi, API_BASE_URL, type VideoResponse } from '../lib/api';
+import {
+  ShieldCheck,
+  Play,
+  RefreshCw,
+  AlertCircle,
+  Sparkles,
+  KeyRound,
+  Lock,
+  Layers,
+  Fingerprint,
+} from 'lucide-react';
 
-const LazyDvideoPlayer = React.lazy(() =>
-  import('../components/dvideo').then((m) => ({ default: m.DvideoPlayer }))
-);
+import { DvideoPlayer } from '../components/dvideo';
 
 export const Route = createFileRoute('/video')({
   component: VideoPage,
@@ -55,8 +63,11 @@ function VideoPage() {
 
   const [videoData, setVideoData] = useState<VideoResponse['video'] | null>(null);
   const [activeUrl, setActiveUrl] = useState<string>('');
+  const [activeSt, setActiveSt] = useState<string>('');
   const [loadingVideo, setLoadingVideo] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const tokenRenewalTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Route protection: redirect to /login if unauthenticated
   useEffect(() => {
@@ -65,6 +76,47 @@ function VideoPage() {
     }
   }, [user, isAuthLoading, navigate]);
 
+  // Silent automatic playback token renewal
+  const scheduleTokenRenewal = useCallback(
+    (expiresInSeconds?: number) => {
+      if (tokenRenewalTimerRef.current) {
+        clearTimeout(tokenRenewalTimerRef.current);
+        tokenRenewalTimerRef.current = null;
+      }
+
+      if (!expiresInSeconds || expiresInSeconds <= 60) return;
+
+      // Refresh ~5 minutes (300s) before expiry, or at 80% if short
+      const refreshBeforeSeconds = Math.min(300, Math.floor(expiresInSeconds * 0.2));
+      const delayMs = Math.max((expiresInSeconds - refreshBeforeSeconds) * 1000, 10000);
+
+      tokenRenewalTimerRef.current = setTimeout(async () => {
+        if (!token) return;
+        try {
+          console.log('[TokenRenewal] Silently renewing playback token before expiry...');
+          const response = await getVideoApi(token);
+          if (response.video?.st) {
+            setActiveSt(response.video.st);
+            setVideoData((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    st: response.video.st,
+                    expiresAt: response.video.expiresAt,
+                    expiresInSeconds: response.video.expiresInSeconds,
+                  }
+                : response.video
+            );
+            scheduleTokenRenewal(response.video.expiresInSeconds);
+          }
+        } catch (err) {
+          console.warn('[TokenRenewal] Silent token renewal failed:', err);
+        }
+      }, delayMs);
+    },
+    [token]
+  );
+
   const fetchVideoStream = async () => {
     if (!token && !user) return;
     setLoadingVideo(true);
@@ -72,8 +124,13 @@ function VideoPage() {
 
     try {
       const response = await getVideoApi(token);
+      if (!response.video?.src) {
+        throw new Error('Backend did not return a valid video stream URL.');
+      }
       setVideoData(response.video);
       setActiveUrl(response.video.src);
+      setActiveSt(response.video.st || '');
+      scheduleTokenRenewal(response.video.expiresInSeconds);
     } catch (err: any) {
       console.error('Failed to fetch video stream:', err);
       setError(err?.message || 'Failed to authenticate and retrieve video stream from backend');
@@ -82,18 +139,73 @@ function VideoPage() {
     }
   };
 
+  // Immediate renewal upon 401 token expiry notice
+  const renewTokenSilently = useCallback(async () => {
+    if (!token) return;
+    try {
+      console.log('[TokenRenewal] Immediate renewal requested by player...');
+      const response = await getVideoApi(token);
+      if (response.video?.st) {
+        setActiveSt(response.video.st);
+        setVideoData((prev) =>
+          prev
+            ? {
+                ...prev,
+                st: response.video.st,
+                expiresAt: response.video.expiresAt,
+                expiresInSeconds: response.video.expiresInSeconds,
+              }
+            : response.video
+        );
+        scheduleTokenRenewal(response.video.expiresInSeconds);
+      }
+    } catch (err) {
+      console.warn('[TokenRenewal] Immediate renewal failed:', err);
+    }
+  }, [token, scheduleTokenRenewal]);
+
+  // Reclaim active session when superseded
+  const handleReclaimSession = useCallback(async () => {
+    console.log('[Session] Reclaiming active playback session...');
+    await fetchVideoStream();
+  }, [fetchVideoStream]);
+
   useEffect(() => {
     if (user && token) {
       fetchVideoStream();
     }
+    return () => {
+      if (tokenRenewalTimerRef.current) {
+        clearTimeout(tokenRenewalTimerRef.current);
+      }
+    };
   }, [user, token]);
 
-  const handlePlayerError = () => {
+  const handlePlayerError = (err?: unknown) => {
+    console.warn('Player error caught in video route:', err);
     if (videoData?.src && activeUrl !== videoData.src) {
       console.warn('Stream failed, falling back to original videoUrl:', videoData.src);
       setActiveUrl(videoData.src);
     }
   };
+
+  const isEncrypted = Boolean(videoData?.encryption);
+
+  // Normalize absolute URLs for player
+  const fullSrc = activeUrl
+    ? activeUrl.startsWith('http')
+      ? activeUrl
+      : `${API_BASE_URL}${activeUrl}`
+    : '';
+
+  const playerEncryption = videoData?.encryption
+    ? {
+        ...videoData.encryption,
+        licenseUrl: videoData.encryption.licenseUrl.startsWith('http')
+          ? videoData.encryption.licenseUrl
+          : `${API_BASE_URL}${videoData.encryption.licenseUrl}`,
+      }
+    : undefined;
 
   if (isAuthLoading) {
     return (
@@ -116,15 +228,24 @@ function VideoPage() {
         {/* Header Title Section */}
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-zinc-800">
           <div>
-            <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-blue-950/60 border border-blue-800/60 text-blue-400 text-xs font-medium mb-2">
-              <ShieldCheck className="w-3.5 h-3.5" />
-              JWT Authenticated Stream
-            </div>
+            {isEncrypted ? (
+              <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-emerald-950/60 border border-emerald-800/60 text-emerald-400 text-xs font-medium mb-2">
+                <Lock className="w-3.5 h-3.5" />
+                CENC-AES-CTR (EME Clear Key)
+              </div>
+            ) : (
+              <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-blue-950/60 border border-blue-800/60 text-blue-400 text-xs font-medium mb-2">
+                <ShieldCheck className="w-3.5 h-3.5" />
+                JWT Authenticated Stream
+              </div>
+            )}
             <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-white flex items-center gap-3">
               <span>{videoData?.title || 'Video Player'}</span>
             </h1>
             <p className="text-xs sm:text-sm text-zinc-400 mt-1">
-              Powered by Video.js latest engine with custom dvideo controls &amp; HLS adaptive bitrate streaming.
+              {isEncrypted
+                ? 'Hardened EME Clear Key DASH pipeline with per-period key rotation, signed access, origin locking & session watermark.'
+                : 'Powered by Video.js latest engine with custom dvideo controls & HLS adaptive bitrate streaming.'}
             </p>
           </div>
 
@@ -141,7 +262,7 @@ function VideoPage() {
           </div>
         </div>
 
-        {/* Direct Video Player Card (matching the exact layout from oeduLMS video player component) */}
+        {/* Video Player Card */}
         <div className="w-full bg-zinc-950 rounded-2xl border border-zinc-800/80 shadow-2xl overflow-hidden">
           {/* Card Header */}
           <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/80">
@@ -153,9 +274,16 @@ function VideoPage() {
                 {videoData?.title || 'Loading Video Stream...'}
               </h3>
             </div>
-            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-950/60 border border-blue-800/50 text-blue-400">
-              HLS .m3u8
-            </span>
+            {isEncrypted ? (
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/50 text-emerald-400 flex items-center gap-1.5">
+                <Lock className="w-3 h-3" />
+                DASH .mpd (Encrypted)
+              </span>
+            ) : (
+              <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-950/60 border border-blue-800/50 text-blue-400">
+                HLS .m3u8
+              </span>
+            )}
           </div>
 
           {/* Video Player Wrapper */}
@@ -166,7 +294,7 @@ function VideoPage() {
                   <div className="absolute inset-0 border-4 border-white/5 border-t-blue-500 rounded-full animate-spin" />
                 </div>
                 <p className="text-xs font-mono text-zinc-400">
-                  Calling backend with JWT token to retrieve m3u8 stream URL...
+                  Calling backend with JWT token to retrieve authenticated stream URL...
                 </p>
               </div>
             ) : error ? (
@@ -183,10 +311,10 @@ function VideoPage() {
                   Retry API Call
                 </button>
               </div>
-            ) : activeUrl ? (
-              isYouTubeUrl(activeUrl) ? (
+            ) : fullSrc ? (
+              isYouTubeUrl(fullSrc) ? (
                 <iframe
-                  src={getYouTubeEmbedUrl(activeUrl)}
+                  src={getYouTubeEmbedUrl(fullSrc)}
                   title={videoData?.title || 'Video'}
                   className="w-full h-full border-0"
                   allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
@@ -194,21 +322,18 @@ function VideoPage() {
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">
-                  <Suspense
-                    fallback={
-                      <div className="flex flex-col items-center gap-2 text-white">
-                        <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
-                        <span className="text-xs font-semibold text-zinc-400">Loading player...</span>
-                      </div>
-                    }
-                  >
-                    <LazyDvideoPlayer
-                      src={activeUrl}
-                      isEnableCinemaMode={true}
-                      className="w-full h-full"
-                      onError={handlePlayerError}
-                    />
-                  </Suspense>
+                  <DvideoPlayer
+                    src={fullSrc}
+                    type={videoData?.type}
+                    encryption={playerEncryption}
+                    st={activeSt}
+                    userEmail={user.email}
+                    onReclaimSession={handleReclaimSession}
+                    onTokenRefreshNeeded={renewTokenSilently}
+                    isEnableCinemaMode={true}
+                    className="w-full h-full"
+                    onError={handlePlayerError}
+                  />
                 </div>
               )
             ) : null}
@@ -224,15 +349,43 @@ function VideoPage() {
             </h2>
             <div className="space-y-2 text-xs font-mono">
               <div className="flex flex-col sm:flex-row sm:justify-between py-1.5 border-b border-zinc-900 gap-1">
-                <span className="text-zinc-500">Source Stream (m3u8):</span>
-                <span className="text-blue-400 truncate max-w-md" title={videoData?.src || ''}>
-                  {videoData?.src || 'Fetching...'}
+                <span className="text-zinc-500">
+                  Source Stream ({isEncrypted ? 'DASH .mpd' : 'HLS .m3u8'}):
+                </span>
+                <span className="text-blue-400 truncate max-w-md" title={fullSrc}>
+                  {fullSrc || 'Fetching...'}
                 </span>
               </div>
               <div className="flex justify-between py-1.5 border-b border-zinc-900">
                 <span className="text-zinc-500">Stream Type:</span>
-                <span className="text-zinc-200">HLS Adaptive Master Playlist (HlsJsVideo)</span>
+                <span className={isEncrypted ? 'text-emerald-400 font-semibold' : 'text-zinc-200'}>
+                  {isEncrypted
+                    ? 'DASH Dynamic Key Rotation (CENC-AES-CTR • EME Clear Key)'
+                    : 'HLS Adaptive Master Playlist (HlsJsVideo)'}
+                </span>
               </div>
+              {isEncrypted && (
+                <>
+                  <div className="flex justify-between py-1.5 border-b border-zinc-900">
+                    <span className="text-zinc-500">DRM Key System:</span>
+                    <span className="text-zinc-200">org.w3.clearkey (W3C EME Clear Key)</span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-zinc-900">
+                    <span className="text-zinc-500">Active Key Periods:</span>
+                    <span className="text-emerald-400 flex items-center gap-1.5">
+                      <Layers className="w-3.5 h-3.5" />
+                      {videoData?.periodCount || 3} Periods (60s rotation)
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-1.5 border-b border-zinc-900">
+                    <span className="text-zinc-500">Session Protection:</span>
+                    <span className="text-blue-400 flex items-center gap-1.5">
+                      <Fingerprint className="w-3.5 h-3.5" />
+                      Single Active Session Enforced (UUID sid)
+                    </span>
+                  </div>
+                </>
+              )}
               <div className="flex justify-between py-1.5 border-b border-zinc-900">
                 <span className="text-zinc-500">Authorized User:</span>
                 <span className="text-zinc-200">{user.email}</span>
@@ -252,12 +405,12 @@ function VideoPage() {
                 Player Features
               </h2>
               <ul className="text-xs text-zinc-400 space-y-1.5 list-disc list-inside">
-                <li>Video.js React + HLS.js engine</li>
-                <li>Quality switcher &amp; speed adjustment</li>
-                <li>Hold <kbd className="bg-zinc-800 px-1 py-0.5 rounded text-[10px] text-zinc-200">Space</kbd> for 2.0x boost</li>
-                <li>Press <kbd className="bg-zinc-800 px-1 py-0.5 rounded text-[10px] text-zinc-200">T</kbd> for Cinema mode</li>
-                <li>Picture-in-Picture &amp; Fullscreen</li>
-                <li>Progress auto-resume tracker</li>
+                <li>Video.js + Shaka Player EME engine</li>
+                <li>CENC-AES-CTR Clear Key hardware decrypt</li>
+                <li>Per-period dynamic key rotation</li>
+                <li>Intermittent live session watermark</li>
+                <li>Single active session enforcement</li>
+                <li>Auto-token renewal &amp; context-menu lock</li>
               </ul>
             </div>
 
@@ -272,3 +425,4 @@ function VideoPage() {
     </div>
   );
 }
+

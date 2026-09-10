@@ -4,13 +4,15 @@
 	"scripts": {
 		"dev": "wrangler dev",
 		"deploy": "wrangler deploy --minify",
-		"cf-typegen": "wrangler types --env-interface CloudflareBindings"
+		"cf-typegen": "wrangler types --env-interface CloudflareBindings",
+		"pipeline": "bun run scripts/encrypt-video.ts"
 	},
 	"dependencies": {
 		"hono": "^4.13.7"
 	},
 	"devDependencies": {
 		"@types/node": "^26.4.1",
+		"shaka-packager": "^3.9.3",
 		"wrangler": "^4.129.0"
 	}
 }

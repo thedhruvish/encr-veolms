@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, memo } from "react";
 import { useCaptionsOptions } from "@videojs/react";
 import { Video } from "@videojs/react/video";
 import { HlsJsVideo } from "@videojs/react/media/hlsjs-video";
+import { ShakaVideo } from "@videojs/react/media/shaka-video";
 import {
   SkipBack,
   SkipForward,
@@ -11,6 +12,9 @@ import {
   Pause,
   Subtitles,
   RectangleHorizontal,
+  AlertCircle,
+  AlertTriangle,
+  RefreshCw,
 } from "lucide-react";
 import { Player } from "../player";
 import { PlayPauseButton } from "./play-pause-button";
@@ -21,6 +25,7 @@ import { SettingsMenu } from "./settings-menu";
 import { PiPFullscreenControls } from "./pip-fullscreen-controls";
 import { ResumePlaybackTracker } from "./resume-playback-tracker";
 import { PlayerTooltip } from "./player-tooltip";
+import { SessionWatermark } from "./session-watermark";
 import {
   Dialog,
   DialogContent,
@@ -44,10 +49,21 @@ interface Props {
   initialPlaybackRate?: number;
   onPlaybackRateChange?: (rate: number) => void;
   onError?: (error?: unknown) => void;
+  encryption?: {
+    scheme: string;
+    keySystem: string;
+    licenseUrl: string;
+  };
+  st?: string;
+  userEmail?: string;
+  onSessionSuperseded?: () => void;
+  onReclaimSession?: () => void;
+  onTokenRefreshNeeded?: () => void;
 }
 
 function DvideoPlayerInner({
   src,
+  type,
   poster,
   onNext,
   onPrev,
@@ -58,8 +74,26 @@ function DvideoPlayerInner({
   initialPlaybackRate,
   onPlaybackRateChange,
   onError,
+  encryption,
+  st,
+  userEmail,
+  onSessionSuperseded,
+  onReclaimSession,
+  onTokenRefreshNeeded,
 }: Props) {
   const store = Player.usePlayer();
+  const media = Player.useMedia();
+
+  const [isSessionSuperseded, setIsSessionSuperseded] = useState(false);
+  const [isCdmUnsupported, setIsCdmUnsupported] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [isHolding2x, setIsHolding2x] = useState(false);
+  const [speedHUD, setSpeedHUD] = useState<{ speed: number; key: number } | null>(null);
+  const [isCinemaMode, setIsCinemaMode] = useState(false);
+  const [feedback, setFeedback] = useState<{ type: "play" | "pause"; key: number } | null>(null);
+  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
 
   const state = Player.usePlayer((s) => ({
     paused: s.paused,
@@ -71,21 +105,170 @@ function DvideoPlayerInner({
     playbackRate: s.playbackRate,
   }));
 
+  const currentPlaybackRate = Player.usePlayer((s) => s.playbackRate);
+
+  const onSessionSupersededRef = useRef(onSessionSuperseded);
+  onSessionSupersededRef.current = onSessionSuperseded;
+
+  const onTokenRefreshNeededRef = useRef(onTokenRefreshNeeded);
+  onTokenRefreshNeededRef.current = onTokenRefreshNeeded;
+
   const stateRef = useRef(state);
   stateRef.current = state;
 
-  const currentPlaybackRate = Player.usePlayer((s) => s.playbackRate);
-
-  const [shortcutsOpen, setShortcutsOpen] = useState(false);
-  const [isHolding2x, setIsHolding2x] = useState(false);
-  const [speedHUD, setSpeedHUD] = useState<{ speed: number; key: number } | null>(null);
-  const [isCinemaMode, setIsCinemaMode] = useState(false);
-  const [feedback, setFeedback] = useState<{ type: "play" | "pause"; key: number } | null>(null);
-  const [containerEl, setContainerEl] = useState<HTMLDivElement | null>(null);
-  const [isBuffering, setIsBuffering] = useState(false);
-  const [showControls, setShowControls] = useState(true);
-
   const controlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    setIsSessionSuperseded(false);
+    setIsCdmUnsupported(false);
+    setIsBuffering(false);
+  }, [src, st]);
+
+  // Helper to parse error details from Shaka Error objects (BAD_HTTP_STATUS / LICENSE_REQUEST_FAILED)
+  const parseShakaErrorInfo = (err: any) => {
+    let isSessionSuperseded = false;
+    let isTokenExpired = false;
+    let isCdmUnsupported = false;
+
+    const actualErr =
+      err?.nativeEvent?.error ||
+      err?.target?.error ||
+      err?.detail?.error ||
+      err?.detail ||
+      err?.error ||
+      err;
+
+    const checkString = (str: string) => {
+      if (!str || typeof str !== "string") return;
+      if (str.includes("session_superseded")) isSessionSuperseded = true;
+      if (str.includes("token_expired")) isTokenExpired = true;
+    };
+
+    const inspect = (val: any) => {
+      if (!val) return;
+      const code = val?.data?.code || val?.code;
+      if (
+        code === 6001 ||
+        String(val?.message || "").includes("6001") ||
+        String(val || "").includes("REQUESTED_KEY_SYSTEM_CONFIG_UNAVAILABLE")
+      ) {
+        isCdmUnsupported = true;
+      }
+
+      if (Array.isArray(val?.data)) {
+        for (const item of val.data) {
+          if (typeof item === "string") checkString(item);
+          else if (typeof item === "object") inspect(item);
+        }
+      }
+      if (typeof val?.message === "string") checkString(val.message);
+      if (typeof val === "string") checkString(val);
+      try {
+        checkString(JSON.stringify(val));
+      } catch {}
+    };
+
+    inspect(actualErr);
+    return { isSessionSuperseded, isTokenExpired, isCdmUnsupported };
+  };
+
+  // Shaka Networking Engine Request and Response Filters + Engine Error Listener
+  useEffect(() => {
+    const engine = (media as any)?.engine;
+    if (!engine) return;
+
+    const networkingEngine = engine.getNetworkingEngine?.();
+    if (!networkingEngine) return;
+
+    // No request filter needed: the manifest and segments are fetched directly from the
+    // public CDN (no backend proxy, no token), and the license URL already carries its
+    // own `st` token baked in by the backend - it's the only backend-gated request left.
+    const responseFilter = (_type: any, response: any) => {
+      if (response && response.status === 401) {
+        setIsBuffering(false);
+        try {
+          const text = new TextDecoder().decode(response.data);
+          const json = JSON.parse(text);
+          if (json.error === "session_superseded") {
+            store.pause();
+            setIsSessionSuperseded(true);
+            onSessionSupersededRef.current?.();
+          } else if (json.error === "token_expired") {
+            onTokenRefreshNeededRef.current?.();
+          }
+        } catch {}
+      }
+    };
+
+    const handleEngineError = (event: any) => {
+      const error = event?.detail || event;
+      const {
+        isSessionSuperseded: isSuperseded,
+        isTokenExpired: isExpired,
+        isCdmUnsupported: isUnsupported,
+      } = parseShakaErrorInfo(error);
+
+      setIsBuffering(false);
+      if (isSuperseded) {
+        store.pause();
+        setIsSessionSuperseded(true);
+        onSessionSupersededRef.current?.();
+      } else if (isExpired) {
+        onTokenRefreshNeededRef.current?.();
+      }
+
+      if (isUnsupported) {
+        setIsCdmUnsupported(true);
+      }
+
+      if (!isSuperseded && !isExpired && !isUnsupported) {
+        onError?.(error);
+      }
+    };
+
+    networkingEngine.registerResponseFilter(responseFilter);
+    engine.addEventListener?.("error", handleEngineError);
+
+    return () => {
+      try {
+        networkingEngine.unregisterResponseFilter(responseFilter);
+        engine.removeEventListener?.("error", handleEngineError);
+      } catch {}
+    };
+  }, [media, src, store]);
+
+  const handleCustomError = (err?: unknown) => {
+    setIsBuffering(false);
+    const {
+      isSessionSuperseded: isSuperseded,
+      isTokenExpired: isExpired,
+      isCdmUnsupported: isUnsupported,
+    } = parseShakaErrorInfo(err);
+
+    if (isSuperseded) {
+      store.pause();
+      setIsSessionSuperseded(true);
+      onSessionSupersededRef.current?.();
+      return;
+    }
+
+    if (isExpired) {
+      onTokenRefreshNeededRef.current?.();
+      return;
+    }
+
+    if (isUnsupported) {
+      setIsCdmUnsupported(true);
+      return;
+    }
+
+    onError?.(err);
+  };
+
+  const handleReclaimSession = () => {
+    setIsSessionSuperseded(false);
+    onReclaimSession?.();
+  };
 
   const resetControlsTimeout = () => {
     if (controlsTimeoutRef.current) {
@@ -436,7 +619,12 @@ function DvideoPlayerInner({
     className
   );
 
-  const isHls = src.endsWith(".m3u8") || src.includes(".m3u8");
+  const isDash =
+    !!encryption ||
+    type === "application/dash+xml" ||
+    src.endsWith(".mpd") ||
+    src.includes(".mpd?");
+  const isHls = !isDash && (src.endsWith(".m3u8") || src.includes(".m3u8"));
 
   return (
     <Player.Container
@@ -445,16 +633,85 @@ function DvideoPlayerInner({
       onMouseMove={handleMouseMove}
       onMouseEnter={handleMouseMove}
       onMouseLeave={handleMouseLeave}
+      onContextMenu={(e) => e.preventDefault()}
     >
+      {/* Session Watermark (Intermittent random hop every 8-10s at 15-20% opacity) */}
+      {encryption && userEmail && <SessionWatermark email={userEmail} />}
+
+      {/* Dedicated Session Superseded Overlay */}
+      {isSessionSuperseded && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-md p-6 text-center animate-in fade-in duration-300 pointer-events-auto">
+          <div className="w-14 h-14 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center mb-4 text-amber-400">
+            <AlertCircle className="w-7 h-7" />
+          </div>
+          <h3 className="text-lg font-bold text-white mb-2">Session Superseded</h3>
+          <p className="text-xs text-zinc-300 max-w-md mb-6 leading-relaxed">
+            Playback was paused because your account is active on another device or browser tab. Only one active stream is permitted per account.
+          </p>
+          <button
+            onClick={handleReclaimSession}
+            className="cursor-pointer inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-semibold shadow-lg shadow-blue-600/20 transition-all hover:scale-105 active:scale-95"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Resume Here</span>
+          </button>
+        </div>
+      )}
+
+      {/* Browser CDM Compatibility Notice */}
+      {isCdmUnsupported && (
+        <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/90 backdrop-blur-md p-6 text-center animate-in fade-in duration-300 pointer-events-auto">
+          <div className="w-14 h-14 rounded-2xl bg-red-500/15 border border-red-500/30 flex items-center justify-center mb-4 text-red-400">
+            <AlertTriangle className="w-7 h-7" />
+          </div>
+          <h3 className="text-lg font-bold text-white mb-2">Browser Not Supported for Clear Key EME</h3>
+          <p className="text-xs text-zinc-300 max-w-md mb-3 leading-relaxed">
+            Clear Key Encrypted Media Extensions (EME) requires a Chromium-based browser (Google Chrome, Microsoft Edge, Brave) or Mozilla Firefox. Playback is unsupported on Safari and iOS WebKit.
+          </p>
+          <div className="text-[11px] text-zinc-400 max-w-md font-mono bg-zinc-900/80 px-3 py-2 rounded-lg border border-zinc-800">
+            Shaka Error 6001: Key system 'org.w3.clearkey' is unavailable in this environment.
+          </div>
+        </div>
+      )}
+
       {/* Click-to-play surface & Hold-to-speedup (z-10) */}
       <div
         onMouseDown={handleMouseDown}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
+        onContextMenu={(e) => e.preventDefault()}
         className="absolute inset-0 cursor-pointer z-10"
       />
 
-      {isHls ? (
+      {isDash ? (
+        <ShakaVideo
+          source={{
+            src,
+            type: "application/dash+xml",
+            drm: encryption
+              ? {
+                  [encryption.keySystem]: {
+                    licenseUrl: encryption.licenseUrl,
+                  },
+                }
+              : undefined,
+          }}
+          poster={poster}
+          className="w-full h-full object-contain"
+          playsInline
+          onWaiting={() => setIsBuffering(true)}
+          onPlaying={() => setIsBuffering(false)}
+          onSeeking={() => setIsBuffering(true)}
+          onSeeked={() => setIsBuffering(false)}
+          onCanPlay={() => setIsBuffering(false)}
+          onCanPlayThrough={() => setIsBuffering(false)}
+          onLoadedData={() => setIsBuffering(false)}
+          onPause={() => setIsBuffering(false)}
+          onAbort={() => setIsBuffering(false)}
+          onEmptied={() => setIsBuffering(false)}
+          onError={handleCustomError}
+        />
+      ) : isHls ? (
         <HlsJsVideo
           src={src}
           poster={poster}
@@ -465,7 +722,12 @@ function DvideoPlayerInner({
           onSeeking={() => setIsBuffering(true)}
           onSeeked={() => setIsBuffering(false)}
           onCanPlay={() => setIsBuffering(false)}
-          onError={onError}
+          onCanPlayThrough={() => setIsBuffering(false)}
+          onLoadedData={() => setIsBuffering(false)}
+          onPause={() => setIsBuffering(false)}
+          onAbort={() => setIsBuffering(false)}
+          onEmptied={() => setIsBuffering(false)}
+          onError={handleCustomError}
         />
       ) : (
         <Video
@@ -478,7 +740,12 @@ function DvideoPlayerInner({
           onSeeking={() => setIsBuffering(true)}
           onSeeked={() => setIsBuffering(false)}
           onCanPlay={() => setIsBuffering(false)}
-          onError={onError}
+          onCanPlayThrough={() => setIsBuffering(false)}
+          onLoadedData={() => setIsBuffering(false)}
+          onPause={() => setIsBuffering(false)}
+          onAbort={() => setIsBuffering(false)}
+          onEmptied={() => setIsBuffering(false)}
+          onError={handleCustomError}
         />
       )}
 

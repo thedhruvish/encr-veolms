@@ -1,10 +1,8 @@
-import React, { Suspense } from "react";
+import React from "react";
 import { motion, AnimatePresence } from "motion/react";
-import { X, Play, Loader2 } from "lucide-react";
+import { X, Play } from "lucide-react";
 
-const LazyDvideoPlayer = React.lazy(() =>
-  import("./dvideo").then((m) => ({ default: m.DvideoPlayer }))
-);
+import { DvideoPlayer } from "./dvideo";
 
 export interface VideoPlayerModalProps {
   isOpen: boolean;
@@ -121,16 +119,7 @@ export function VideoPlayerModal({
                 />
               ) : (
                 <div className="w-full h-full flex items-center justify-center">
-                  <Suspense
-                    fallback={
-                      <div className="flex flex-col items-center gap-2 text-white">
-                        <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
-                        <span className="text-xs font-semibold text-zinc-400">Loading player...</span>
-                      </div>
-                    }
-                  >
-                    <LazyDvideoPlayer src={activeUrl} onError={handlePlayerError} />
-                  </Suspense>
+                  <DvideoPlayer src={activeUrl} onError={handlePlayerError} />
                 </div>
               )}
             </div>
