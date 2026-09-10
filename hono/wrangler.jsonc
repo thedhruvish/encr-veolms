@@ -43,4 +43,12 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
 	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
+
+	/**
+	 * Hyperdrive – Neon PostgreSQL connection pooling
+	 * Run once to create: wrangler hyperdrive create veolms-neon --connection-string "$DATABASE_URL"
+	 * Then paste the returned ID below.
+	 * https://developers.cloudflare.com/hyperdrive/
+	 */
+	// "hyperdrive": [{ "binding": "HYPERDRIVE", "id": "<YOUR_HYPERDRIVE_ID>" }]
 }

@@ -7,6 +7,8 @@ import {
   GENERATED_KEY_STORE,
   GENERATED_VIDEOS,
 } from "./registry.generated";
+import { createDb } from "./db";
+
 export interface VideoRecord {
   id: string;
   title: string;
@@ -19,7 +21,6 @@ const app = new Hono<{ Bindings: CloudflareBindings }>();
 // Auth and Session Secrets
 const JWT_SECRET = "veolms-secure-jwt-token-secret-key-2026";
 const TOKEN_EXPIRY_SECONDS = 20 * 60; // 20 minutes (1200 seconds)
-const ALLOWED_EMAIL = "dhruvish@gmail.com";
 
 // Playback Token & EME Configuration
 const PLAYBACK_JWT_SECRET = "veolms-playback-clearkey-secret-2026";
@@ -33,6 +34,7 @@ const LOCAL_ORIGINS = new Set([
 ]);
 const VIDEO_PUBLIC_BASE_URL = "https://protech-assets.dhruvish.in";
 
+// Fallback in-memory catalog (synced to DB via scripts/seed-db.ts)
 const VIDEOS: Record<string, VideoRecord> = {
   ...GENERATED_VIDEOS,
 };
@@ -43,25 +45,6 @@ const KEY_STORE: Record<string, string> = {
 
 const DEFAULT_VIDEO_ID =
   GENERATED_DEFAULT_VIDEO_ID || Object.keys(VIDEOS)[0] || "";
-
-/**
- * Single Active Session Tracker:
- * Maps user email -> active sessionId (UUID).
- *
- * NOTE ON MULTI-REGION DEPLOYMENTS (Phase 2h caveat):
- * ACTIVE_SESSION is stored in memory for zero-dependency local development and single-isolate
- * execution. In a production multi-region Cloudflare Workers deployment where worker isolates
- * do not share RAM across edge datacenters, this store should be migrated to Cloudflare KV,
- * Hyperdrive, or a Durable Object to maintain global single-session consistency.
- */
-const ACTIVE_SESSION: Record<string, string> = {};
-
-/**
- * Single-use license lock: `${sessionId}:${kidHex}` entries already issued to a session.
- * Same in-memory/single-isolate caveat as ACTIVE_SESSION above - fine for local dev,
- * would need KV/a Durable Object to hold across a real multi-region deployment.
- */
-const ISSUED_LICENSE_KEYS = new Set<string>();
 
 // Helper: Origin and Referer validation
 function isOriginAllowed(originOrReferer: string | undefined): boolean {
@@ -100,7 +83,23 @@ app.get("/message", (c) => {
   return c.text("Hello Hono!");
 });
 
-// Helper for handling login
+// DB health check – pings Neon and returns table list
+app.get("/api/db-health", async (c) => {
+  try {
+    const db = createDb(c.env);
+    const rows = await db`
+      SELECT table_name
+      FROM information_schema.tables
+      WHERE table_schema = 'public'
+      ORDER BY table_name
+    `;
+    return c.json({ ok: true, tables: rows.map((r: any) => r.table_name) });
+  } catch (err: any) {
+    return c.json({ ok: false, error: err?.message ?? String(err) }, 500);
+  }
+});
+
+// Helper for handling login — queries Neon users table
 const handleLogin = async (c: any) => {
   let email: string | undefined;
 
@@ -117,10 +116,19 @@ const handleLogin = async (c: any) => {
 
   const normalizedEmail = email.trim().toLowerCase();
 
-  if (normalizedEmail !== ALLOWED_EMAIL.toLowerCase()) {
+  const db = createDb(c.env);
+  const users = await db`
+    SELECT id, email, name, role
+    FROM users
+    WHERE LOWER(email) = ${normalizedEmail}
+    LIMIT 1
+  `;
+  const user = users[0];
+
+  if (!user) {
     return c.json(
       {
-        error: `Unauthorized email. Without a database, please use '${ALLOWED_EMAIL}' to log in.`,
+        error: `Unauthorized email. User '${normalizedEmail}' not found in database.`,
       },
       401
     );
@@ -130,7 +138,7 @@ const handleLogin = async (c: any) => {
   const exp = now + TOKEN_EXPIRY_SECONDS;
 
   const payload = {
-    email: normalizedEmail,
+    email: user.email,
     iat: now,
     exp: exp,
   };
@@ -151,7 +159,10 @@ const handleLogin = async (c: any) => {
     message: "Login successful",
     token,
     user: {
-      email: normalizedEmail,
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      role: user.role,
       exp,
       expiresAt: new Date(exp * 1000).toISOString(),
       expiresInSeconds: TOKEN_EXPIRY_SECONDS,
@@ -162,15 +173,30 @@ const handleLogin = async (c: any) => {
 app.post("/login", handleLogin);
 app.post("/api/login", handleLogin);
 
-// Helper for handling logout
-const handleLogout = (c: any) => {
+// Helper for handling logout — clears cookie and active DB session
+const handleLogout = async (c: any) => {
+  const payload = await getAuthenticatedPayload(c);
+  if (payload?.email) {
+    try {
+      const db = createDb(c.env);
+      await db`
+        DELETE FROM sessions
+        WHERE user_id IN (
+          SELECT id FROM users WHERE LOWER(email) = ${payload.email.toLowerCase()}
+        )
+      `;
+    } catch (err) {
+      console.warn("Could not delete session from DB on logout:", err);
+    }
+  }
+
   deleteCookie(c, "token", {
     path: "/",
   });
 
   return c.json({
     success: true,
-    message: "Logged out successfully. JWT cleared.",
+    message: "Logged out successfully. JWT and active session cleared.",
   });
 };
 
@@ -249,7 +275,7 @@ app.get("/api/me", handleMe);
 
 /**
  * Validate playback session token (?st= or Authorization: Bearer <st>)
- * Validates: signature, expiry, videoId match, and single-active-session consistency.
+ * Validates: signature, expiry, videoId match, and single-active-session consistency via PostgreSQL.
  */
 async function validatePlaybackToken(c: any, expectedVid?: string) {
   let st = c.req.query("st");
@@ -306,15 +332,32 @@ async function validatePlaybackToken(c: any, expectedVid?: string) {
       };
     }
 
-    // Single active session enforcement:
-    // If a subsequent login/stream request occurred for this user, a new sessionId was assigned.
-    const activeSid = ACTIVE_SESSION[payload.email];
-    if (!activeSid || activeSid !== payload.sid) {
+    // Single active session enforcement from Neon DB:
+    // If a subsequent stream request occurred for this user, a new sessionId was assigned.
+    const db = createDb(c.env);
+    const [activeSession] = await db`
+      SELECT s.session_id, s.expires_at
+      FROM sessions s
+      JOIN users u ON s.user_id = u.id
+      WHERE LOWER(u.email) = ${payload.email.toLowerCase()}
+      LIMIT 1
+    `;
+
+    if (!activeSession || activeSession.session_id !== payload.sid) {
       return {
         valid: false,
         status: 401,
         error: "session_superseded",
         message: "Playback session superseded by another device or browser tab.",
+      };
+    }
+
+    if (new Date(activeSession.expires_at).getTime() < Date.now()) {
+      return {
+        valid: false,
+        status: 401,
+        error: "token_expired",
+        message: "Playback session token has expired in database.",
       };
     }
 
@@ -361,7 +404,7 @@ function hexToBase64Url(hex: string): string {
 
 /**
  * Route: GET /video and /api/video
- * Authenticates login JWT, assigns a new single active session, mints playback JWT (st),
+ * Authenticates login JWT, assigns a new single active session in Neon DB, mints playback JWT (st),
  * and returns encrypted DASH stream and Clear Key DRM license endpoint.
  */
 const handleVideo = async (c: any) => {
@@ -382,8 +425,42 @@ const handleVideo = async (c: any) => {
     );
   }
 
-  const requestedVid = c.req.query("id") || DEFAULT_VIDEO_ID;
-  const videoRecord = VIDEOS[requestedVid];
+  const db = createDb(c.env);
+  let requestedVid = c.req.query("id");
+
+  if (!requestedVid) {
+    const [firstVideo] = await db`SELECT id FROM videos ORDER BY created_at ASC LIMIT 1`;
+    requestedVid = firstVideo?.id || DEFAULT_VIDEO_ID;
+  }
+
+  // Look up video and periods from Neon DB (fallback to GENERATED_VIDEOS)
+  const [dbVideo] = await db`
+    SELECT id, title, manifest_path
+    FROM videos
+    WHERE id = ${requestedVid}
+    LIMIT 1
+  `;
+
+  let videoRecord: VideoRecord | undefined;
+  if (dbVideo) {
+    const periods = await db`
+      SELECT period_idx, key_id
+      FROM video_key_periods
+      WHERE video_id = ${requestedVid}
+      ORDER BY period_idx ASC
+    `;
+    videoRecord = {
+      id: dbVideo.id,
+      title: dbVideo.title,
+      manifestPath: dbVideo.manifest_path,
+      periods: periods.map((p: any) => ({
+        index: Number(p.period_idx),
+        keyId: String(p.key_id),
+      })),
+    };
+  } else if (VIDEOS[requestedVid]) {
+    videoRecord = VIDEOS[requestedVid];
+  }
 
   if (!videoRecord) {
     return c.json(
@@ -392,7 +469,7 @@ const handleVideo = async (c: any) => {
         error: "encrypted_video_not_configured",
         message: "No encrypted video is configured for this video ID.",
       },
-      404,
+      404
     );
   }
 
@@ -400,8 +477,30 @@ const handleVideo = async (c: any) => {
   const exp = now + PLAYBACK_TOKEN_EXPIRY_SECONDS;
   const sessionId = crypto.randomUUID();
 
-  // Enforce single active session: supersede any prior session for this account
-  ACTIVE_SESSION[payload.email] = sessionId;
+  // Enforce single active session: persist in Neon DB sessions table
+  const [user] = await db`
+    SELECT id FROM users WHERE LOWER(email) = ${payload.email.toLowerCase()} LIMIT 1
+  `;
+  if (!user) {
+    return c.json(
+      {
+        authenticated: false,
+        error: "unauthorized_user",
+        message: "User not found in database.",
+      },
+      401
+    );
+  }
+
+  const expiresAtIso = new Date(exp * 1000).toISOString();
+  await db`
+    INSERT INTO sessions (user_id, session_id, expires_at)
+    VALUES (${user.id}, ${sessionId}, ${expiresAtIso})
+    ON CONFLICT (user_id) DO UPDATE SET
+      session_id = EXCLUDED.session_id,
+      expires_at = EXCLUDED.expires_at,
+      created_at = NOW()
+  `;
 
   const stPayload = {
     email: payload.email,
@@ -413,10 +512,9 @@ const handleVideo = async (c: any) => {
 
   const st = await sign(stPayload, PLAYBACK_JWT_SECRET, "HS256");
 
-  // Keep the media URL same-origin so the Worker can authorize the manifest and every
-  // segment request. The proxy fetches the encrypted bytes from the public R2 domain;
-  // the decryption key is still returned only by the gated Clear Key license endpoint.
-  const manifestUrl = `/assets/${videoRecord.manifestPath}?st=${encodeURIComponent(st)}`;
+  // Direct R2 bucket delivery: client downloads manifest and encrypted DASH chunks directly from S3_PUBLIC_URL.
+  // The decryption keys remain gated by the Clear Key license endpoint on this Worker via Neon DB.
+  const manifestUrl = `${getVideoPublicBaseUrl(c)}/${videoRecord.manifestPath}`;
 
   return c.json({
     authenticated: true,
@@ -454,116 +552,17 @@ function getVideoPublicBaseUrl(c: any): string {
     .replace(/\/+$/, "");
 }
 
-function getVideoAssetPath(
-  urlString: string,
-): { videoId: string; objectKey: string } | null {
-  const pathname = new URL(urlString).pathname;
-  const prefix = "/assets/";
-  if (!pathname.startsWith(prefix)) return null;
-
-  const encodedParts = pathname.slice(prefix.length).split("/");
-  if (encodedParts.length < 2 || encodedParts.some((part) => !part))
-    return null;
-
-  try {
-    const parts = encodedParts.map((part) => decodeURIComponent(part));
-    if (
-      parts.some(
-        (part) => !part || part === "." || part === ".." || /[\/\\]/.test(part),
-      )
-    ) {
-      return null;
-    }
-
-    return {
-      videoId: parts[0],
-      objectKey: parts.join("/"),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function getVideoAssetContentType(objectKey: string): string {
-  if (objectKey.endsWith(".mpd")) return "application/dash+xml";
-  if (objectKey.endsWith(".m4s")) return "video/mp4";
-  return "application/octet-stream";
-}
-
-/**
- * Route: GET/HEAD /assets/:id/*
- * Authenticates the playback session, then proxies encrypted DASH bytes from public R2.
- * The R2 object is never treated as a decryption source by this Worker; only the
- * Clear Key license route returns key material to the browser media subsystem.
- */
-const handleVideoAsset = async (c: any) => {
-  const originHeader = c.req.header("Origin") || c.req.header("Referer");
-  if (originHeader && !isOriginAllowed(originHeader)) {
-    return c.json({ error: "Forbidden. Origin not permitted." }, 403);
-  }
-
-  const asset = getVideoAssetPath(c.req.url);
-  if (!asset) return c.text("Not Found", 404);
-
-  const validation = await validatePlaybackToken(c, asset.videoId);
-  if (!validation.valid) {
-    return c.json(
-      { error: validation.error, message: validation.message },
-      validation.status as any,
-    );
-  }
-
-  if (!VIDEOS[asset.videoId]) return c.text("Not Found", 404);
-
-  const encodedKey = asset.objectKey
-    .split("/")
-    .map(encodeURIComponent)
-    .join("/");
-  const upstreamUrl = `${getVideoPublicBaseUrl(c)}/${encodedKey}`;
-  const upstreamHeaders = new Headers();
-
-  for (const headerName of ["Range", "If-None-Match", "If-Modified-Since"]) {
-    const value = c.req.header(headerName);
-    if (value) upstreamHeaders.set(headerName, value);
-  }
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(upstreamUrl, {
-      method: c.req.method,
-      headers: upstreamHeaders,
-    });
-  } catch {
-    return c.json({ error: "video_storage_unavailable" }, 502);
-  }
-
-  const responseHeaders = new Headers();
-  upstream.headers.forEach((value, key) => {
-    if (!key.toLowerCase().startsWith("access-control-")) {
-      responseHeaders.set(key, value);
-    }
-  });
-  if (!responseHeaders.has("Content-Type")) {
-    responseHeaders.set(
-      "Content-Type",
-      getVideoAssetContentType(asset.objectKey),
-    );
-  }
-  responseHeaders.set("Cache-Control", "private, no-store, max-age=0");
-  responseHeaders.set("X-Content-Type-Options", "nosniff");
-
-  return new Response(c.req.method === "HEAD" ? null : upstream.body, {
-    status: upstream.status,
-    headers: responseHeaders,
-  });
-};
-
-app.on(["GET", "HEAD"], "/assets/*", handleVideoAsset);
+// Redirect any legacy /assets/* requests directly to S3_PUBLIC_URL (R2 bucket)
+app.on(["GET", "HEAD"], "/assets/*", (c) => {
+  const pathname = new URL(c.req.url).pathname;
+  const objectKey = pathname.replace(/^\/assets\//, "");
+  return c.redirect(`${getVideoPublicBaseUrl(c)}/${objectKey}`, 301);
+});
 
 /**
  * Route: POST /license/clearkey and /api/license/clearkey
  * W3C Clear Key License Exchange (CENC-AES-CTR).
- * Validates playback token and returns key set for requested KIDs.
+ * Validates playback token and returns key set for requested KIDs, tracking single-use locks in Neon DB.
  */
 const handleClearKeyLicense = async (c: any) => {
   const originHeader = c.req.header("Origin") || c.req.header("Referer");
@@ -597,13 +596,32 @@ const handleClearKeyLicense = async (c: any) => {
     return c.json({ error: "Missing or invalid 'kids' array in Clear Key request." }, 400);
   }
 
-  const video = vid ? VIDEOS[vid] : undefined;
-  const allowedKids = new Set(video?.periods.map((p) => p.keyId.toLowerCase()) || []);
+  const db = createDb(c.env);
+
+  let allowedKids = new Set<string>();
+  if (vid) {
+    const periods = await db`
+      SELECT key_id FROM video_key_periods WHERE video_id = ${vid}
+    `;
+    if (periods.length > 0) {
+      allowedKids = new Set(periods.map((p: any) => String(p.key_id).toLowerCase()));
+    } else if (VIDEOS[vid]) {
+      allowedKids = new Set(VIDEOS[vid].periods.map((p) => p.keyId.toLowerCase()));
+    }
+  }
+
+  // Check which KIDs have already been issued to this session in the database
+  const issuedRows = await db`
+    SELECT key_id FROM issued_license_keys WHERE session_id = ${sid}
+  `;
+  const issuedKidSet = new Set(
+    issuedRows.map((r: any) => String(r.key_id).toLowerCase())
+  );
 
   const keys: { kty: string; k: string; kid: string }[] = [];
 
   for (const kidB64Url of body.kids) {
-    const kidHex = base64UrlToHex(kidB64Url);
+    const kidHex = base64UrlToHex(kidB64Url).toLowerCase();
 
     // Verify KID belongs to requested video if vid was provided
     if (allowedKids.size > 0 && !allowedKids.has(kidHex)) {
@@ -616,12 +634,8 @@ const handleClearKeyLicense = async (c: any) => {
       );
     }
 
-    // Single-use lock: this session already pulled this KID's key once. Rejecting the
-    // repeat blocks a copied license-request URL being replayed later by someone who
-    // isn't the live session - it does not (and cannot) stop the legitimate session
-    // from reading its own already-issued key in DevTools.
-    const usageKey = `${sid}:${kidHex}`;
-    if (ISSUED_LICENSE_KEYS.has(usageKey)) {
+    // Single-use lock in DB: check if already issued
+    if (issuedKidSet.has(kidHex)) {
       return c.json(
         {
           error: "key_already_issued",
@@ -631,7 +645,11 @@ const handleClearKeyLicense = async (c: any) => {
       );
     }
 
-    const keyHex = KEY_STORE[kidHex];
+    // Look up key from drm_keys table in DB (with fallback to KEY_STORE)
+    const [keyRow] = await db`
+      SELECT key_val FROM drm_keys WHERE LOWER(key_id) = ${kidHex} LIMIT 1
+    `;
+    const keyHex = keyRow?.key_val || KEY_STORE[kidHex];
     if (!keyHex) {
       return c.json(
         { error: "key_not_found", message: `Key not found for KID ${kidHex}` },
@@ -647,10 +665,14 @@ const handleClearKeyLicense = async (c: any) => {
     });
   }
 
-  // Only mark KIDs as issued after the whole batch validated successfully, so a
-  // partially-invalid request never burns a still-unissued key.
+  // Persist all issued keys in DB for this session
   for (const { kid: kidB64Url } of keys) {
-    ISSUED_LICENSE_KEYS.add(`${sid}:${base64UrlToHex(kidB64Url)}`);
+    const kidHex = base64UrlToHex(kidB64Url).toLowerCase();
+    await db`
+      INSERT INTO issued_license_keys (session_id, key_id)
+      VALUES (${sid}, ${kidHex})
+      ON CONFLICT (session_id, key_id) DO NOTHING
+    `;
   }
 
   return c.json({

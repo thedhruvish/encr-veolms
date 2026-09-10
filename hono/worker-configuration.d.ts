@@ -3,6 +3,7 @@
 // Runtime types generated with workerd@1.20260903.1 2026-09-03 
 interface __BaseEnv_CloudflareBindings {
 	ASSETS: Fetcher;
+	DATABASE_URL?: string;
 	S3_PUBLIC_URL?: string;
 	S3_ENDPOINT?: string;
 	S3_BUCKET?: string;
