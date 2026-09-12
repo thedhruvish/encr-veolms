@@ -7,7 +7,8 @@
 		"cf-typegen": "wrangler types --env-interface CloudflareBindings",
 		"pipeline": "bun run scripts/encrypt-video.ts",
 		"seed": "bun run scripts/seed-db.ts",
-		"test": "bun run scripts/test-pipeline.ts"
+		"test": "bun run scripts/test-pipeline.ts",
+		"download": "bun run scripts/download-video.ts"
 	},
 	"dependencies": {
 		"@neondatabase/serverless": "^1.1.0",
