@@ -207,6 +207,9 @@ function VideoPage() {
             `${API_BASE_URL.replace(/\/+$/, '')}/`,
           );
           if (activeSt) licenseUrl.searchParams.set('st', activeSt);
+          if (videoData.id && !licenseUrl.searchParams.has('vid')) {
+            licenseUrl.searchParams.set('vid', videoData.id);
+          }
           return licenseUrl.toString();
         })(),
       }

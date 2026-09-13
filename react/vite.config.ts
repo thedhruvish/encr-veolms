@@ -24,6 +24,10 @@ const config = defineConfig({
         target: 'http://localhost:8787',
         changeOrigin: true,
       },
+      '/clearkey': {
+        target: 'http://localhost:8787',
+        changeOrigin: true,
+      },
     },
   },
   plugins: [

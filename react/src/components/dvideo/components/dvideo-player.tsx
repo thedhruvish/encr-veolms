@@ -61,22 +61,6 @@ interface Props {
   onTokenRefreshNeeded?: () => void;
 }
 
-function base64UrlToHex(str: string): string {
-  if (/^[0-9a-fA-F]{32}$/.test(str)) {
-    return str.toLowerCase();
-  }
-  let b64 = str.replace(/-/g, "+").replace(/_/g, "/");
-  while (b64.length % 4 !== 0) {
-    b64 += "=";
-  }
-  const bin = atob(b64);
-  let hex = "";
-  for (let i = 0; i < bin.length; i++) {
-    hex += bin.charCodeAt(i).toString(16).padStart(2, "0");
-  }
-  return hex.toLowerCase();
-}
-
 function DvideoPlayerInner({
   src,
   type,
@@ -99,9 +83,7 @@ function DvideoPlayerInner({
 }: Props) {
   const store = Player.usePlayer();
   const media = Player.useMedia();
-
-  const [clearKeys, setClearKeys] = useState<Record<string, string> | null>(null);
-  const [isLoadingKeys, setIsLoadingKeys] = useState(false);
+  console.log(encryption)
   const [isSessionSuperseded, setIsSessionSuperseded] = useState(false);
   const [isCdmUnsupported, setIsCdmUnsupported] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
@@ -195,13 +177,54 @@ function DvideoPlayerInner({
     const engine = (media as any)?.engine;
     if (!engine) return;
 
+    if (encryption?.licenseUrl) {
+      const keySystem = encryption.keySystem || "org.w3.clearkey";
+      engine.configure({
+        drm: {
+          servers: {
+            [keySystem]: encryption.licenseUrl,
+          },
+        },
+      });
+    }
+
     const networkingEngine = engine.getNetworkingEngine?.();
     if (!networkingEngine) return;
 
     // DASH does not carry the manifest query string onto relative segment URLs. Add
     // the short-lived playback token to every same-origin protected-media request.
     const sourceUrl = new URL(src, window.location.href);
-    const requestFilter = (_type: any, request: any) => {
+    const requestFilter = (type: any, request: any) => {
+      // Check if this is a DRM License Request
+      const isLicenseRequest =
+        type === 2 /* RequestType.LICENSE */ ||
+        Boolean(request.licenseRequestType) ||
+        request.uris?.some((u: string) => u.includes("/license") || u.includes("/clearkey"));
+
+      if (isLicenseRequest) {
+        request.headers = request.headers || {};
+        request.headers["Content-Type"] = "application/json";
+        if (st) {
+          request.headers["Authorization"] = `Bearer ${st}`;
+        }
+        request.allowCrossSiteCredentials = true;
+
+        if (st) {
+          request.uris = request.uris.map((uri: string) => {
+            try {
+              const url = new URL(uri, window.location.href);
+              if (!url.searchParams.has("st")) {
+                url.searchParams.set("st", st);
+              }
+              return url.toString();
+            } catch {
+              return uri;
+            }
+          });
+        }
+        return;
+      }
+
       if (!st) return;
 
       request.uris = request.uris.map((uri: string) => {
@@ -272,7 +295,7 @@ function DvideoPlayerInner({
         engine.removeEventListener?.("error", handleEngineError);
       } catch {}
     };
-  }, [media, src, st, store]);
+  }, [media, src, st, store, encryption?.licenseUrl, encryption?.keySystem]);
 
   const handleCustomError = (err?: unknown) => {
     setIsBuffering(false);
@@ -306,85 +329,6 @@ function DvideoPlayerInner({
     setIsSessionSuperseded(false);
     onReclaimSession?.();
   };
-
-  // Pre-fetch ClearKey licenses in a single batch request to avoid N separate period calls
-  useEffect(() => {
-    if (
-      !encryption ||
-      encryption.keySystem !== "org.w3.clearkey" ||
-      !encryption.licenseUrl
-    ) {
-      setClearKeys(null);
-      setIsLoadingKeys(false);
-      return;
-    }
-
-    let isCancelled = false;
-    setIsLoadingKeys(true);
-
-    const fetchKeys = async () => {
-      try {
-        const res = await fetch(encryption.licenseUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ type: "temporary", all: true }),
-        });
-
-        if (isCancelled) return;
-
-        if (!res.ok) {
-          if (res.status === 401) {
-            try {
-              const errData: any = await res.json();
-              if (errData?.error === "session_superseded") {
-                store.pause();
-                setIsSessionSuperseded(true);
-                onSessionSupersededRef.current?.();
-                return;
-              }
-              if (errData?.error === "token_expired") {
-                onTokenRefreshNeededRef.current?.();
-                return;
-              }
-            } catch {}
-          }
-          throw new Error(`License fetch failed with status ${res.status}`);
-        }
-
-        const data: any = await res.json();
-        if (isCancelled) return;
-
-        if (Array.isArray(data?.keys)) {
-          const map: Record<string, string> = {};
-          for (const kItem of data.keys) {
-            if (kItem?.kid && kItem?.k) {
-              const kidHex = base64UrlToHex(kItem.kid);
-              const keyHex = base64UrlToHex(kItem.k);
-              map[kidHex] = keyHex;
-            }
-          }
-          setClearKeys(map);
-        }
-      } catch (err) {
-        if (!isCancelled) {
-          console.error("Failed to prefetch ClearKey license:", err);
-          handleCustomError(err);
-        }
-      } finally {
-        if (!isCancelled) {
-          setIsLoadingKeys(false);
-        }
-      }
-    };
-
-    fetchKeys();
-
-    return () => {
-      isCancelled = true;
-    };
-  }, [encryption?.licenseUrl, st, src]);
 
   const resetControlsTimeout = () => {
     if (controlsTimeoutRef.current) {
@@ -800,48 +744,55 @@ function DvideoPlayerInner({
       />
 
       {isDash ? (
-        isLoadingKeys ? (
-          <div className="w-full h-full flex flex-col items-center justify-center gap-3">
-            <div className="w-8 h-8 border-2 border-zinc-700 border-t-white rounded-full animate-spin" />
-            <p className="text-xs text-zinc-400 font-mono">Initializing secure player...</p>
-          </div>
-        ) : (
-          <ShakaVideo
-            source={{
-              src,
-              type: "application/dash+xml",
-              drm: encryption
-                ? {
-                    [encryption.keySystem]: {
-                      licenseUrl: encryption.licenseUrl,
-                    },
+        <ShakaVideo
+          source={{
+            src,
+            type: "application/dash+xml",
+            drm: {
+"org.w3.clearkey": {
+licenseUrl: encryption?.licenseUrl || "",
+}
+            },
+            // drm: encryption
+            //   ? {
+            //       [encryption.keySystem]: {
+            //         licenseUrl: encryption.licenseUrl,
+            //       },
+            //     }
+            //   : undefined,
+            engine: {
+              shaka: {
+                drm: {
+                  servers: {
+                    "org.w3.clearkey": encryption?.licenseUrl || "",
                   }
-                : undefined,
-              engine: {
-                shaka: {
-                  drm: {
-                    ...(clearKeys ? { clearKeys } : {}),
-                    delayLicenseRequestUntilPlayed: true,
-                  },
-                },
-              },
-            }}
-            poster={poster}
-            className="w-full h-full object-contain"
-            playsInline
-            onWaiting={() => setIsBuffering(true)}
-            onPlaying={() => setIsBuffering(false)}
-            onSeeking={() => setIsBuffering(true)}
-            onSeeked={() => setIsBuffering(false)}
-            onCanPlay={() => setIsBuffering(false)}
-            onCanPlayThrough={() => setIsBuffering(false)}
-            onLoadedData={() => setIsBuffering(false)}
-            onPause={() => setIsBuffering(false)}
-            onAbort={() => setIsBuffering(false)}
-            onEmptied={() => setIsBuffering(false)}
-            onError={handleCustomError}
-          />
-        )
+                }
+              }
+              //   drm: {
+              //     servers: encryption
+              //       ? {
+              //           [encryption.keySystem]: encryption.licenseUrl,
+              //         }
+              //       : {},
+              //   },
+              // },
+            },
+          }}
+          poster={poster}
+          className="w-full h-full object-contain"
+          playsInline
+          onWaiting={() => setIsBuffering(true)}
+          onPlaying={() => setIsBuffering(false)}
+          onSeeking={() => setIsBuffering(true)}
+          onSeeked={() => setIsBuffering(false)}
+          onCanPlay={() => setIsBuffering(false)}
+          onCanPlayThrough={() => setIsBuffering(false)}
+          onLoadedData={() => setIsBuffering(false)}
+          onPause={() => setIsBuffering(false)}
+          onAbort={() => setIsBuffering(false)}
+          onEmptied={() => setIsBuffering(false)}
+          onError={handleCustomError}
+        />
       ) : isHls ? (
         <HlsJsVideo
           src={src}

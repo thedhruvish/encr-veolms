@@ -52,7 +52,13 @@ function isOriginAllowed(originOrReferer: string | undefined): boolean {
   try {
     const url = new URL(originOrReferer);
     const origin = url.origin;
-    return origin === ALLOWED_ORIGIN || LOCAL_ORIGINS.has(origin);
+    if (origin === ALLOWED_ORIGIN || LOCAL_ORIGINS.has(origin)) {
+      return true;
+    }
+    if (url.hostname === "dhruvish.in" || url.hostname.endsWith(".dhruvish.in")) {
+      return true;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -383,6 +389,9 @@ async function validatePlaybackToken(c: any, expectedVid?: string) {
 
 // Pure Web API base64url helpers (guaranteed portable across Cloudflare Workers and Bun)
 function base64UrlToHex(b64url: string): string {
+  if (/^[0-9a-fA-F]{32}$/.test(b64url)) {
+    return b64url.toLowerCase();
+  }
   let base64 = b64url.replace(/-/g, "+").replace(/_/g, "/");
   while (base64.length % 4 !== 0) base64 += "=";
   const binary = atob(base64);
@@ -570,8 +579,8 @@ const handleClearKeyLicense = async (c: any) => {
     return c.json({ error: "Forbidden. Invalid origin." }, 403);
   }
 
-  const vid = c.req.query("vid");
-  const validation = await validatePlaybackToken(c, vid);
+  const requestedVid = c.req.query("vid");
+  const validation = await validatePlaybackToken(c, requestedVid);
   if (!validation.valid) {
     return c.json(
       { error: validation.error, message: validation.message },
@@ -579,6 +588,7 @@ const handleClearKeyLicense = async (c: any) => {
     );
   }
   const sid = validation.payload!.sid as string;
+  const vid = requestedVid || validation.payload?.vid;
 
   let body: { kids?: string[]; type?: string; all?: boolean } = {};
   if (c.req.method === "POST") {
@@ -727,5 +737,9 @@ app.post("/license/clearkey", handleClearKeyLicense);
 app.get("/license/clearkey", handleClearKeyLicense);
 app.post("/api/license/clearkey", handleClearKeyLicense);
 app.get("/api/license/clearkey", handleClearKeyLicense);
+app.post("/clearkey/license", handleClearKeyLicense);
+app.get("/clearkey/license", handleClearKeyLicense);
+app.post("/api/clearkey/license", handleClearKeyLicense);
+app.get("/api/clearkey/license", handleClearKeyLicense);
 
 export default app;

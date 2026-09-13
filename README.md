@@ -20,14 +20,14 @@ sequenceDiagram
     User->>Hono: GET /video (Bearer JWT)
     Hono->>DB: Invalidate previous active sessions for user (single device lock)
     Hono->>DB: Mint new session_id & signed playback token (st)
-    Hono-->>React: Video metadata + R2 manifest URL + st
-    React->>Hono: POST /license/clearkey (with st, all: true)
-    Hono->>DB: Verify session is active (sessions.is_active = true)
-    Hono->>DB: Fetch all 22 period decryption keys
-    Hono-->>React: JWK Key Set (all 22 rotated keys)
-    React->>React: Inject keys into Shaka EME CDM (org.w3.clearkey)
+    Hono-->>React: Video metadata + R2 manifest URL + DRM license server URL + st
     React->>R2: Fetch manifest.mpd & encrypted .m4s segments
     R2-->>React: Encrypted video & audio chunks
+    React->>Hono: Shaka EME License Request: POST /clearkey/license (or /license/clearkey)
+    Hono->>DB: Verify session is active (sessions.is_active = true)
+    Hono->>DB: Fetch period decryption key(s)
+    Hono-->>React: JWK Key Set (org.w3.clearkey)
+    React->>React: Browser CDM decrypts natively in protected media stack
     React->>User: Decrypted playback + Floating Watermark
 ```
 
