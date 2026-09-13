@@ -50,11 +50,28 @@ CREATE TABLE IF NOT EXISTS drm_keys (
   key_val TEXT NOT NULL       -- hex key value
 );
 
--- Issued license keys per playback session
--- Prevents replay: a session can only pull each KID once
+-- Issued license keys per playback session.
+-- Not a hard replay block: Shaka can legitimately re-request the same KID
+-- within one session (e.g. seeking back reopens a closed MediaKeySession).
+-- issue_count tracks reissues so the license route can rate-limit instead.
 CREATE TABLE IF NOT EXISTS issued_license_keys (
-  session_id  TEXT NOT NULL,
-  key_id      TEXT NOT NULL,
-  issued_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  session_id      TEXT NOT NULL,
+  key_id          TEXT NOT NULL,
+  issue_count     INT NOT NULL DEFAULT 1,
+  first_issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  last_issued_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (session_id, key_id)
 );
+
+-- Safe to re-run against an already-provisioned DB (e.g. before this change).
+ALTER TABLE issued_license_keys ADD COLUMN IF NOT EXISTS issue_count INT NOT NULL DEFAULT 1;
+ALTER TABLE issued_license_keys ADD COLUMN IF NOT EXISTS last_issued_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'issued_license_keys' AND column_name = 'issued_at'
+  ) THEN
+    ALTER TABLE issued_license_keys RENAME COLUMN issued_at TO first_issued_at;
+  END IF;
+END $$;

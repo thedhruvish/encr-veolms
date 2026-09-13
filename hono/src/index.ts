@@ -25,6 +25,12 @@ const TOKEN_EXPIRY_SECONDS = 20 * 60; // 20 minutes (1200 seconds)
 // Playback Token & EME Configuration
 const PLAYBACK_JWT_SECRET = "veolms-playback-clearkey-secret-2026";
 const PLAYBACK_TOKEN_EXPIRY_SECONDS = 30 * 60; // 30 minutes playback session token
+
+// Cap on how many times one session may re-request the same KID. Shaka can
+// legitimately re-fetch a KID within a session (e.g. seeking back reopens a
+// closed MediaKeySession), so this rate-limits rather than hard-blocking —
+// it's meant to catch key-scraping loops, not normal playback.
+const MAX_KEY_REISSUES_PER_SESSION = 5;
 const ALLOWED_ORIGIN = "https://encr-veolms.dhruvish.in";
 const LOCAL_ORIGINS = new Set([
   "http://localhost:3000",
@@ -437,32 +443,35 @@ const handleVideo = async (c: any) => {
   const db = createDb(c.env);
   let requestedVid = c.req.query("id");
 
+  // Fires immediately - it only needs the JWT's email, not the resolved video
+  // id, so it runs concurrently with video lookup instead of waiting behind
+  // it. Neon's HTTP driver pays real latency per round-trip, so overlapping
+  // independent queries (rather than a chain of sequential awaits) matters.
+  const userPromise = db`
+    SELECT id FROM users WHERE LOWER(email) = ${payload.email.toLowerCase()} LIMIT 1
+  `;
+
   if (!requestedVid) {
     const [firstVideo] = await db`SELECT id FROM videos ORDER BY created_at ASC LIMIT 1`;
     requestedVid = firstVideo?.id || DEFAULT_VIDEO_ID;
   }
 
-  // Look up video and periods from Neon DB (fallback to GENERATED_VIDEOS)
-  const [dbVideo] = await db`
-    SELECT id, title, manifest_path
-    FROM videos
-    WHERE id = ${requestedVid}
-    LIMIT 1
-  `;
+  // Video row and its key periods are independent of each other too - run together.
+  const [dbVideoRows, periodRows, userRows] = await Promise.all([
+    db`SELECT id, title, manifest_path FROM videos WHERE id = ${requestedVid} LIMIT 1`,
+    db`SELECT period_idx, key_id FROM video_key_periods WHERE video_id = ${requestedVid} ORDER BY period_idx ASC`,
+    userPromise,
+  ]);
+  const dbVideo = dbVideoRows[0];
+  const user = userRows[0];
 
   let videoRecord: VideoRecord | undefined;
   if (dbVideo) {
-    const periods = await db`
-      SELECT period_idx, key_id
-      FROM video_key_periods
-      WHERE video_id = ${requestedVid}
-      ORDER BY period_idx ASC
-    `;
     videoRecord = {
       id: dbVideo.id,
       title: dbVideo.title,
       manifestPath: dbVideo.manifest_path,
-      periods: periods.map((p: any) => ({
+      periods: periodRows.map((p: any) => ({
         index: Number(p.period_idx),
         keyId: String(p.key_id),
       })),
@@ -482,14 +491,6 @@ const handleVideo = async (c: any) => {
     );
   }
 
-  const now = Math.floor(Date.now() / 1000);
-  const exp = now + PLAYBACK_TOKEN_EXPIRY_SECONDS;
-  const sessionId = crypto.randomUUID();
-
-  // Enforce single active session: persist in Neon DB sessions table
-  const [user] = await db`
-    SELECT id FROM users WHERE LOWER(email) = ${payload.email.toLowerCase()} LIMIT 1
-  `;
   if (!user) {
     return c.json(
       {
@@ -501,6 +502,12 @@ const handleVideo = async (c: any) => {
     );
   }
 
+  const now = Math.floor(Date.now() / 1000);
+  const exp = now + PLAYBACK_TOKEN_EXPIRY_SECONDS;
+  const sessionId = crypto.randomUUID();
+
+  // Only minted once the video is confirmed to exist and the user is confirmed
+  // valid - a bad/typo'd ?id= must never supersede a user's real active session.
   const expiresAtIso = new Date(exp * 1000).toISOString();
   await db`
     INSERT INTO sessions (user_id, session_id, expires_at)
@@ -561,17 +568,35 @@ function getVideoPublicBaseUrl(c: any): string {
     .replace(/\/+$/, "");
 }
 
-// Redirect any legacy /assets/* requests directly to S3_PUBLIC_URL (R2 bucket)
-app.on(["GET", "HEAD"], "/assets/*", (c) => {
-  const pathname = new URL(c.req.url).pathname;
-  const objectKey = pathname.replace(/^\/assets\//, "");
-  return c.redirect(`${getVideoPublicBaseUrl(c)}/${objectKey}`, 301);
-});
+/**
+ * Records an issuance of every KID in `kidHexList` to session `sid` in a
+ * single round-trip (via unnest), returning each KID's running issuance
+ * count (see MAX_KEY_REISSUES_PER_SESSION). Neon's serverless driver pays
+ * HTTP latency per query, so batching this instead of awaiting one INSERT
+ * per KID matters a lot once a video has more than a handful of periods.
+ */
+const recordKeyIssuances = async (
+  db: ReturnType<typeof createDb>,
+  sid: string,
+  kidHexList: string[]
+): Promise<Map<string, number>> => {
+  // Dedupe: a single multi-row INSERT can't ON CONFLICT-update the same row twice.
+  const uniqueKids = [...new Set(kidHexList)];
+  if (uniqueKids.length === 0) return new Map();
+  const rows = await db`
+    INSERT INTO issued_license_keys (session_id, key_id)
+    SELECT ${sid}, unnest(${uniqueKids}::text[])
+    ON CONFLICT (session_id, key_id)
+    DO UPDATE SET issue_count = issued_license_keys.issue_count + 1, last_issued_at = NOW()
+    RETURNING key_id, issue_count
+  `;
+  return new Map(rows.map((r: any) => [String(r.key_id), Number(r.issue_count)]));
+};
 
 /**
  * Route: POST /license/clearkey and /api/license/clearkey
  * W3C Clear Key License Exchange (CENC-AES-CTR).
- * Validates playback token and returns key set for requested KIDs, tracking single-use locks in Neon DB.
+ * Validates playback token and returns key set for requested KIDs, rate-limiting reissuance per session in Neon DB.
  */
 const handleClearKeyLicense = async (c: any) => {
   const originHeader = c.req.header("Origin") || c.req.header("Referer");
@@ -647,16 +672,25 @@ const handleClearKeyLicense = async (c: any) => {
       return c.json({ error: "no_keys_found", message: `No keys found for video ${vid}.` }, 404);
     }
 
-    // Persist all issued keys in DB for this session
-    for (const { kidHex } of keysData) {
-      await db`
-        INSERT INTO issued_license_keys (session_id, key_id)
-        VALUES (${sid}, ${kidHex})
-        ON CONFLICT (session_id, key_id) DO NOTHING
-      `;
+    // Persist issuance for this session in one round-trip, rate-limiting reissuance per KID
+    const issuance = await recordKeyIssuances(db, sid, keysData.map((k) => k.kidHex));
+    const allowedKeysData = keysData.filter((entry) => {
+      const issueCount = issuance.get(entry.kidHex) ?? 1;
+      if (issueCount > MAX_KEY_REISSUES_PER_SESSION) {
+        console.warn(`clearkey license: reissue cap hit (session=${sid}, kid=${entry.kidHex}, count=${issueCount})`);
+        return false;
+      }
+      return true;
+    });
+
+    if (allowedKeysData.length === 0) {
+      return c.json(
+        { error: "rate_limited", message: "Key reissue limit exceeded for this session." },
+        429
+      );
     }
 
-    const keys = keysData.map(({ kidHex, keyHex }) => ({
+    const keys = allowedKeysData.map(({ kidHex, keyHex }) => ({
       kty: "oct",
       k: hexToBase64Url(keyHex),
       kid: hexToBase64Url(kidHex),
@@ -681,12 +715,10 @@ const handleClearKeyLicense = async (c: any) => {
     }
   }
 
-  const keys: { kty: string; k: string; kid: string }[] = [];
+  const kidHexList = body.kids.map((k) => base64UrlToHex(k).toLowerCase());
 
-  for (const kidB64Url of body.kids) {
-    const kidHex = base64UrlToHex(kidB64Url).toLowerCase();
-
-    // Verify KID belongs to requested video if vid was provided
+  // Verify every requested KID belongs to the requested video up front (allowedKids is already in memory - no DB call)
+  for (const kidHex of kidHexList) {
     if (allowedKids.size > 0 && !allowedKids.has(kidHex)) {
       return c.json(
         {
@@ -696,35 +728,42 @@ const handleClearKeyLicense = async (c: any) => {
         403
       );
     }
-
-    // Look up key from drm_keys table in DB (with fallback to KEY_STORE)
-    const [keyRow] = await db`
-      SELECT key_val FROM drm_keys WHERE LOWER(key_id) = ${kidHex} LIMIT 1
-    `;
-    const keyHex = keyRow?.key_val || KEY_STORE[kidHex];
-    if (!keyHex) {
-      return c.json(
-        { error: "key_not_found", message: `Key not found for KID ${kidHex}` },
-        404
-      );
-    }
-
-    const keyB64Url = hexToBase64Url(keyHex);
-    keys.push({
-      kty: "oct",
-      k: keyB64Url,
-      kid: kidB64Url,
-    });
   }
 
-  // Persist all issued keys in DB for this session
-  for (const { kid: kidB64Url } of keys) {
-    const kidHex = base64UrlToHex(kidB64Url).toLowerCase();
-    await db`
-      INSERT INTO issued_license_keys (session_id, key_id)
-      VALUES (${sid}, ${kidHex})
-      ON CONFLICT (session_id, key_id) DO NOTHING
-    `;
+  // Batch-fetch all requested key values in one round-trip (fallback to KEY_STORE for any DB misses)
+  const keyRows = await db`
+    SELECT key_id, key_val FROM drm_keys WHERE LOWER(key_id) = ANY(${kidHexList}::text[])
+  `;
+  const keyValueByKid = new Map<string, string>(
+    keyRows.map((r: any) => [String(r.key_id).toLowerCase(), r.key_val])
+  );
+  for (const kidHex of kidHexList) {
+    if (!keyValueByKid.has(kidHex) && !KEY_STORE[kidHex]) {
+      return c.json({ error: "key_not_found", message: `Key not found for KID ${kidHex}` }, 404);
+    }
+  }
+
+  // Persist issuance for this session in one round-trip, rate-limiting reissuance per KID
+  const issuance = await recordKeyIssuances(db, sid, kidHexList);
+
+  const keys: { kty: string; k: string; kid: string }[] = [];
+  for (let i = 0; i < body.kids.length; i++) {
+    const kidB64Url = body.kids[i];
+    const kidHex = kidHexList[i];
+    const issueCount = issuance.get(kidHex) ?? 1;
+    if (issueCount > MAX_KEY_REISSUES_PER_SESSION) {
+      console.warn(`clearkey license: reissue cap hit (session=${sid}, kid=${kidHex}, count=${issueCount})`);
+      continue;
+    }
+    const keyHex = keyValueByKid.get(kidHex) || KEY_STORE[kidHex];
+    keys.push({ kty: "oct", k: hexToBase64Url(keyHex), kid: kidB64Url });
+  }
+
+  if (keys.length === 0) {
+    return c.json(
+      { error: "rate_limited", message: "Key reissue limit exceeded for this session." },
+      429
+    );
   }
 
   return c.json({

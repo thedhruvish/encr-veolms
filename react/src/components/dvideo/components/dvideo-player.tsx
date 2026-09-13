@@ -177,17 +177,9 @@ function DvideoPlayerInner({
     const engine = (media as any)?.engine;
     if (!engine) return;
 
-    if (encryption?.licenseUrl) {
-      const keySystem = encryption.keySystem || "org.w3.clearkey";
-      engine.configure({
-        drm: {
-          servers: {
-            [keySystem]: encryption.licenseUrl,
-          },
-        },
-      });
-    }
-
+    // DRM servers are configured via `source.engine.shaka.drm.servers` on
+    // <ShakaVideo> instead of here — configuring it twice risks the two
+    // paths racing/disagreeing on the same underlying Shaka player.
     const networkingEngine = engine.getNetworkingEngine?.();
     if (!networkingEngine) return;
 
@@ -748,39 +740,35 @@ function DvideoPlayerInner({
           source={{
             src,
             type: "application/dash+xml",
-            drm: {
-"org.w3.clearkey": {
-licenseUrl: encryption?.licenseUrl || "",
-}
-            },
-            // drm: encryption
-            //   ? {
-            //       [encryption.keySystem]: {
-            //         licenseUrl: encryption.licenseUrl,
-            //       },
-            //     }
-            //   : undefined,
             engine: {
               shaka: {
                 drm: {
-                  servers: {
-                    "org.w3.clearkey": encryption?.licenseUrl || "",
-                  }
-                }
-              }
-              //   drm: {
-              //     servers: encryption
-              //       ? {
-              //           [encryption.keySystem]: encryption.licenseUrl,
-              //         }
-              //       : {},
-              //   },
-              // },
+                  servers: encryption?.licenseUrl
+                    ? { [encryption.keySystem || "org.w3.clearkey"]: encryption.licenseUrl }
+                    : {},
+                },
+                // Shaka requests a license as soon as it buffers a period's
+                // segments, not lazily as each period starts playing. With no
+                // cap here it uses its default lookahead and tries to buffer
+                // (and therefore fetch keys for) many key-rotation periods at
+                // once on load. Capping it to ~1-2 periods means only the
+                // first period's key is needed to start playback; later
+                // periods' keys get requested progressively as playback
+                // actually approaches them.
+                streaming: {
+                  bufferingGoal: 12,
+                  rebufferingGoal: 4,
+                },
+              },
             },
           }}
           poster={poster}
           className="w-full h-full object-contain"
           playsInline
+          controlsList="nodownload noremoteplayback"
+          disablePictureInPicture
+          disableRemotePlayback
+          onDragStart={(e: any) => e.preventDefault()}
           onWaiting={() => setIsBuffering(true)}
           onPlaying={() => setIsBuffering(false)}
           onSeeking={() => setIsBuffering(true)}
@@ -799,6 +787,10 @@ licenseUrl: encryption?.licenseUrl || "",
           poster={poster}
           className="w-full h-full object-contain"
           playsInline
+          controlsList="nodownload noremoteplayback"
+          disablePictureInPicture
+          disableRemotePlayback
+          onDragStart={(e: any) => e.preventDefault()}
           onWaiting={() => setIsBuffering(true)}
           onPlaying={() => setIsBuffering(false)}
           onSeeking={() => setIsBuffering(true)}
@@ -817,6 +809,10 @@ licenseUrl: encryption?.licenseUrl || "",
           poster={poster}
           className="w-full h-full object-contain"
           playsInline
+          controlsList="nodownload noremoteplayback"
+          disablePictureInPicture
+          disableRemotePlayback
+          onDragStart={(e: any) => e.preventDefault()}
           onWaiting={() => setIsBuffering(true)}
           onPlaying={() => setIsBuffering(false)}
           onSeeking={() => setIsBuffering(true)}

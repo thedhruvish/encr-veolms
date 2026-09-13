@@ -88,19 +88,6 @@ async function runTests() {
     "Direct R2 manifest XML contains valid multi-period DASH tags"
   );
 
-  // 4b. Verify legacy /assets redirect
-  const legacyRedirectRes = await app.request(`/assets/${vid}/manifest.mpd`, {
-    method: "GET",
-    headers: { Origin: origin },
-  });
-  assert(
-    legacyRedirectRes.status === 301,
-    "GET /assets/... returns 301 redirect to direct R2 public bucket URL"
-  );
-  assert(
-    legacyRedirectRes.headers.get("location") === `https://protech-assets.dhruvish.in/${vid}/manifest.mpd`,
-    "Redirect location matches direct R2 URL"
-  );
 
   // 5. Test Clear Key License Exchange (POST /license/clearkey)
   // Read local registry to get real KID
@@ -178,7 +165,10 @@ async function runTests() {
   });
   assert(batchLicenseRes.status === 200, "POST /license/clearkey with all:true returns 200 OK");
   const batchData: any = await batchLicenseRes.json();
-  assert(Array.isArray(batchData.keys) && batchData.keys.length === 22, "Batch license returns all 22 keys in 1 request");
+  assert(
+    Array.isArray(batchData.keys) && batchData.keys.length === videoJson.video.periodCount,
+    `Batch license returns all ${videoJson.video.periodCount} keys in 1 request`
+  );
 
   // 5e. Test /clearkey/license endpoint alias
   const clearkeyAliasRes = await app.request(`/clearkey/license?vid=${vid}&st=${encodeURIComponent(st1)}`, {
@@ -380,20 +370,6 @@ async function runTests() {
     }),
   });
   assert(rawLicenseRes.status === 200, "POST /license/clearkey accepts raw text JSON payload");
-
-  // 8d. Verify live HTTP server redirects legacy /assets requests to R2 bucket
-  try {
-    const liveServerAssetRes = await fetch(`http://localhost:8787/assets/${vid}/manifest.mpd`, {
-      headers: { Origin: origin },
-      redirect: "manual",
-    });
-    assert(
-      liveServerAssetRes.status === 301,
-      "Live server redirects legacy /assets requests with 301 to direct R2 URL"
-    );
-  } catch {
-    console.log("ℹ Live server check skipped (server not responding on port 8787)");
-  }
 
   console.log("\n=================================================");
   console.log(`TEST SUMMARY: ${passed} PASSED, ${failed} FAILED`);
