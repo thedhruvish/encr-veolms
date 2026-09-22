@@ -404,30 +404,6 @@ function VideoPage() {
               </div>
             </div>
           </div>
-
-          {/* Quick Shortcuts & Features Card */}
-          <div className="p-5 rounded-2xl bg-zinc-950 border border-zinc-800 space-y-3 flex flex-col justify-between">
-            <div>
-              <h2 className="text-sm font-semibold text-white flex items-center gap-2 mb-2">
-                <Sparkles className="w-4 h-4 text-amber-400" />
-                Player Features
-              </h2>
-              <ul className="text-xs text-zinc-400 space-y-1.5 list-disc list-inside">
-                <li>Video.js + Shaka Player EME engine</li>
-                <li>CENC-AES-CTR Clear Key hardware decrypt</li>
-                <li>Per-period dynamic key rotation</li>
-                <li>Intermittent live session watermark</li>
-                <li>Single active session enforcement</li>
-                <li>Auto-token renewal &amp; context-menu lock</li>
-              </ul>
-            </div>
-
-            <div className="pt-3 border-t border-zinc-900">
-              <span className="text-[11px] text-zinc-500 font-mono">
-                Press <kbd className="bg-zinc-800 text-zinc-300 px-1 rounded">Shift + ?</kbd> in player for shortcuts
-              </span>
-            </div>
-          </div>
         </div>
       </div>
     </div>
